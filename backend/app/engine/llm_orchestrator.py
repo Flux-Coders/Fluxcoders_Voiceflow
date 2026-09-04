@@ -21,7 +21,12 @@ from typing import Any, Dict, List, Optional
 from app.core.cancellation import CancellationToken
 from app.core.session import Session
 from app.core.versioning import RequestVersionGate
-from app.engine.llm_provider import BaseLLMClient, MockLLMClient
+from app.engine.llm_provider import (
+    BaseLLMClient,
+    LLMCancellationError,
+    LLMError,
+    MockLLMClient,
+)
 from app.models import (
     EventLevel,
     LLMMessage,
@@ -136,13 +141,54 @@ class LLMOrchestrator:
             payload={"prompt": prompt, "current_slots": current_slots},
         )
 
-        llm_resp: LLMResponse = await self.llm_client.generate(
-            messages=messages,
-            tools=schemas,
-            cancellation_token=token,
-            request_id=request_id,
-            version=version,
-        )
+        try:
+            llm_resp: LLMResponse = await self.llm_client.generate(
+                messages=messages,
+                tools=schemas,
+                cancellation_token=token,
+                request_id=request_id,
+                version=version,
+            )
+        except LLMCancellationError:
+            session.event_logger.log_event(
+                event_type=VoiceEventType.LLM_STEP1_CANCELLED,
+                session_id=session.session_id,
+                request_id=request_id,
+                version=version,
+                message=f"LLM Step 1 cancelled for Request #{version}",
+                level=EventLevel.WARN,
+            )
+            return TurnExecutionResult(
+                request_id=request_id,
+                version=version,
+                success=False,
+                is_stale=True,
+                error="LLM Step 1 cancelled.",
+            )
+        except LLMError as e:
+            session.event_logger.log_event(
+                event_type=VoiceEventType.LLM_STEP1_FAILED,
+                session_id=session.session_id,
+                request_id=request_id,
+                version=version,
+                message=f"LLM Step 1 failed: {e.message}",
+                level=EventLevel.ERROR,
+                payload={"error": e.message, "provider": e.provider, "status_code": e.status_code},
+            )
+            fallback_text = "I'm having trouble connecting to the reasoning service right now. Please try again."
+            committed = session.complete_turn(
+                request_id=request_id,
+                version=version,
+                assistant_response=fallback_text,
+                trigger_rime=trigger_rime,
+            )
+            return TurnExecutionResult(
+                request_id=request_id,
+                version=version,
+                success=False,
+                assistant_response=fallback_text if committed else None,
+                error=f"LLM Step 1 error: {e.message}",
+            )
 
         # -------------------------------------------------------------
         # CHECKPOINT 2: Post-Step-1 Cancellation / Version Check
@@ -194,10 +240,12 @@ class LLMOrchestrator:
             except Exception as e:
                 logger.warning("Failed to apply slot patch: %s", e)
 
+        num_tools = len(llm_resp.tool_calls)
+
         # -------------------------------------------------------------
-        # BRANCH A: Direct Text Response (Missing Slots / Chit-chat)
+        # BRANCH A: 0 Tool Calls -> Direct Text Response (Missing Slots / Chit-chat)
         # -------------------------------------------------------------
-        if not llm_resp.tool_calls:
+        if num_tools == 0:
             direct_text = llm_resp.content or "How can I help you?"
             committed = session.complete_turn(
                 request_id=request_id,
@@ -214,7 +262,35 @@ class LLMOrchestrator:
             )
 
         # -------------------------------------------------------------
-        # BRANCH B: Tool Call Requested
+        # BRANCH B: >1 Tool Calls -> Explicitly Reject as Unsupported
+        # -------------------------------------------------------------
+        if num_tools > 1:
+            session.event_logger.log_event(
+                event_type=VoiceEventType.TOOL_UNKNOWN_OR_FORBIDDEN,
+                session_id=session.session_id,
+                request_id=request_id,
+                version=version,
+                message=f"Multiple tool calls ({num_tools}) received; VoiceFlow only supports single tool execution per turn.",
+                level=EventLevel.WARN,
+                payload={"tool_count": num_tools, "tool_names": [tc.name for tc in llm_resp.tool_calls]},
+            )
+            err_msg = "Multiple simultaneous tool calls are not supported. Please make one request at a time."
+            committed = session.complete_turn(
+                request_id=request_id,
+                version=version,
+                assistant_response=err_msg,
+                trigger_rime=trigger_rime,
+            )
+            return TurnExecutionResult(
+                request_id=request_id,
+                version=version,
+                success=False,
+                assistant_response=err_msg if committed else None,
+                error="Multiple tool calls are unsupported.",
+            )
+
+        # -------------------------------------------------------------
+        # BRANCH C: Exactly 1 Tool Call Requested
         # -------------------------------------------------------------
         tool_call = llm_resp.tool_calls[0]
         tool_name = tool_call.name
@@ -356,12 +432,56 @@ class LLMOrchestrator:
             )
         )
 
-        synthesis_resp = await self.llm_client.generate(
-            messages=synthesis_messages,
-            cancellation_token=token,
-            request_id=request_id,
-            version=version,
-        )
+        try:
+            synthesis_resp = await self.llm_client.generate(
+                messages=synthesis_messages,
+                cancellation_token=token,
+                request_id=request_id,
+                version=version,
+            )
+        except LLMCancellationError:
+            session.event_logger.log_event(
+                event_type=VoiceEventType.LLM_STEP2_CANCELLED,
+                session_id=session.session_id,
+                request_id=request_id,
+                version=version,
+                message=f"LLM Step 2 cancelled for Request #{version}",
+                level=EventLevel.WARN,
+            )
+            return TurnExecutionResult(
+                request_id=request_id,
+                version=version,
+                success=False,
+                tool_task=tool_task,
+                is_stale=True,
+                error="LLM Step 2 cancelled.",
+            )
+        except LLMError as e:
+            session.event_logger.log_event(
+                event_type=VoiceEventType.LLM_STEP2_FAILED,
+                session_id=session.session_id,
+                request_id=request_id,
+                version=version,
+                message=f"LLM Step 2 failed: {e.message}",
+                level=EventLevel.ERROR,
+                payload={"error": e.message, "provider": e.provider, "status_code": e.status_code},
+            )
+            fallback_text = "I received the train search results but encountered an error synthesizing the summary."
+            committed = session.complete_turn(
+                request_id=request_id,
+                version=version,
+                assistant_response=fallback_text,
+                tool_call={"name": tool_name, "args": validated_args},
+                trigger_rime=trigger_rime,
+            )
+            return TurnExecutionResult(
+                request_id=request_id,
+                version=version,
+                success=False,
+                assistant_response=fallback_text if committed else None,
+                tool_task=tool_task,
+                error=f"LLM Step 2 error: {e.message}",
+            )
 
         # -------------------------------------------------------------
         # CHECKPOINT 5: Post-Step-2 Cancellation / Version Check

@@ -1,18 +1,29 @@
-"""VoiceFlow LLM Provider Abstraction and Deterministic Mock Client.
+"""VoiceFlow LLM Provider Abstraction, Mock Client, and OpenAI-Compatible Client.
 
 Provides:
 - BaseLLMClient: Provider-agnostic abstract interface.
 - MockLLMClient: Deterministic mock implementation supporting slot extraction,
   constraint addition, replacement, clearing, tool-calling, and response synthesis.
+- OpenAILLMClient: Production OpenAI-compatible chat completions client.
+- OpenAIConfig: Pydantic configuration for OpenAI-compatible LLM endpoints.
+- create_llm_client: Factory for instantiating configured LLM clients.
+- Typed LLM domain exceptions (LLMError, LLMConfigError, etc.).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
+
+import httpx
+from pydantic import BaseModel, Field
+
 from app.core.cancellation import CancellationToken
 from app.models import (
     LLMMessage,
@@ -20,6 +31,66 @@ from app.models import (
     SlotPatch,
     ToolCallRequest,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# LLM Provider Domain Exceptions
+# -----------------------------------------------------------------------------
+class LLMError(Exception):
+    """Base exception for all LLM provider errors."""
+
+    def __init__(
+        self,
+        message: str,
+        provider: str = "openai",
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.provider = provider
+        self.status_code = status_code
+
+
+class LLMConfigError(LLMError):
+    """Raised when LLM configuration parameters are invalid or missing."""
+    pass
+
+
+class LLMAuthenticationError(LLMError):
+    """Raised on HTTP 401/403 authentication failures."""
+    pass
+
+
+class LLMBadRequestError(LLMError):
+    """Raised on HTTP 400 Bad Request."""
+    pass
+
+
+class LLMRateLimitError(LLMError):
+    """Raised on HTTP 429 rate limit exceeded."""
+    pass
+
+
+class LLMServerError(LLMError):
+    """Raised on HTTP 5xx upstream server errors."""
+    pass
+
+
+class LLMTimeoutError(LLMError):
+    """Raised when LLM HTTP request times out."""
+    pass
+
+
+class LLMConnectionError(LLMError):
+    """Raised on network connection failures."""
+    pass
+
+
+class LLMCancellationError(LLMError):
+    """Raised when LLM generation is cancelled by user interruption."""
+    pass
 
 
 class BaseLLMClient(ABC):
@@ -335,4 +406,252 @@ class MockLLMClient(BaseLLMClient):
             content=response_text,
             finish_reason="stop",
         )
+
+
+# -----------------------------------------------------------------------------
+# OpenAI Configuration Model
+# -----------------------------------------------------------------------------
+class OpenAIConfig(BaseModel):
+    """Configuration options for OpenAI-compatible LLM provider."""
+
+    api_key: Optional[str] = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
+    base_url: str = Field(default_factory=lambda: os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    model: str = Field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    temperature: float = Field(default_factory=lambda: float(os.getenv("OPENAI_TEMPERATURE", "0.1")))
+    timeout_seconds: float = Field(default_factory=lambda: float(os.getenv("OPENAI_TIMEOUT_SECONDS", "15.0")))
+
+    @classmethod
+    def from_env(cls) -> OpenAIConfig:
+        """Loads configuration from environment variables."""
+        return cls()
+
+    def validate_config(self, require_key: bool = True) -> None:
+        """Validates configuration parameters."""
+        if require_key and (not self.api_key or self.api_key.strip() in ("", "your_openai_api_key_here")):
+            raise LLMConfigError("OPENAI_API_KEY is not configured in environment.")
+        if not self.base_url.startswith(("http://", "https://")):
+            raise LLMConfigError(f"Invalid OPENAI_BASE_URL: '{self.base_url}'. Must start with http:// or https://")
+        if not self.model or not self.model.strip():
+            raise LLMConfigError("OPENAI_MODEL cannot be empty.")
+
+
+# -----------------------------------------------------------------------------
+# Concrete OpenAI LLM Client
+# -----------------------------------------------------------------------------
+class OpenAILLMClient(BaseLLMClient):
+    """Official OpenAI-compatible Chat Completions LLM Client."""
+
+    def __init__(
+        self,
+        config: Optional[OpenAIConfig] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
+        self.config = config or OpenAIConfig.from_env()
+        self._custom_transport = transport
+        self._external_http_client = http_client
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Creates or returns an httpx.AsyncClient."""
+        if self._external_http_client:
+            return self._external_http_client
+        if self._custom_transport:
+            return httpx.AsyncClient(transport=self._custom_transport, timeout=self.config.timeout_seconds)
+        return httpx.AsyncClient(timeout=self.config.timeout_seconds)
+
+    async def generate(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        cancellation_token: Optional[CancellationToken] = None,
+        request_id: Optional[str] = None,
+        version: Optional[int] = None,
+    ) -> LLMResponse:
+        """Generates a text completion or structured tool call via OpenAI-compatible endpoint."""
+        # Pre-call cancellation check
+        if cancellation_token and cancellation_token.is_cancelled:
+            return LLMResponse(content=None, finish_reason="cancelled")
+
+        # Validate configuration before making the call
+        self.config.validate_config(require_key=True)
+
+        # Convert LLMMessage list to OpenAI messages format
+        openai_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            if msg.role == "system":
+                openai_messages.append({"role": "system", "content": msg.content or ""})
+            elif msg.role == "user":
+                openai_messages.append({"role": "user", "content": msg.content or ""})
+            elif msg.role == "assistant":
+                m_dict: Dict[str, Any] = {"role": "assistant"}
+                if msg.content is not None:
+                    m_dict["content"] = msg.content
+                else:
+                    m_dict["content"] = None
+                if msg.tool_calls:
+                    m_dict["tool_calls"] = [
+                        {
+                            "id": tc.id or f"call-{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else (tc.arguments or "{}"),
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ]
+                openai_messages.append(m_dict)
+            elif msg.role == "tool":
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id or "",
+                    "name": msg.name or "",
+                    "content": msg.content or "",
+                })
+
+        payload: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": openai_messages,
+            "temperature": self.config.temperature,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.config.base_url.rstrip('/')}/chat/completions"
+
+        # Execute HTTP request
+        client = self._get_client()
+        should_close = (self._external_http_client is None)
+
+        try:
+            # Cancellation check right before network dispatch
+            if cancellation_token and cancellation_token.is_cancelled:
+                return LLMResponse(content=None, finish_reason="cancelled")
+
+            response = await client.post(url, json=payload, headers=headers)
+        except httpx.TimeoutException as e:
+            raise LLMTimeoutError(
+                f"OpenAI request timed out after {self.config.timeout_seconds}s.",
+                provider="openai",
+            ) from e
+        except (httpx.ConnectError, httpx.NetworkError, httpx.TransportError) as e:
+            raise LLMConnectionError(
+                f"Network error connecting to OpenAI endpoint at {self.config.base_url}.",
+                provider="openai",
+            ) from e
+        finally:
+            if should_close:
+                await client.aclose()
+
+        # Cancellation check right after response received
+        if cancellation_token and cancellation_token.is_cancelled:
+            return LLMResponse(content=None, finish_reason="cancelled")
+
+        # Handle HTTP error status codes
+        status = response.status_code
+        if status in (401, 403):
+            raise LLMAuthenticationError(
+                f"OpenAI authentication failed with HTTP {status}. Please check your OPENAI_API_KEY.",
+                provider="openai",
+                status_code=status,
+            )
+        elif status == 400:
+            err_text = response.text[:200]
+            raise LLMBadRequestError(
+                f"OpenAI bad request (HTTP 400): {err_text}",
+                provider="openai",
+                status_code=status,
+            )
+        elif status == 429:
+            raise LLMRateLimitError(
+                "OpenAI rate limit exceeded (HTTP 429).",
+                provider="openai",
+                status_code=status,
+            )
+        elif status >= 500:
+            raise LLMServerError(
+                f"OpenAI server error (HTTP {status}).",
+                provider="openai",
+                status_code=status,
+            )
+        elif not (200 <= status < 300):
+            raise LLMError(
+                f"OpenAI unexpected HTTP status {status}.",
+                provider="openai",
+                status_code=status,
+            )
+
+        try:
+            data = response.json()
+        except Exception as json_err:
+            raise LLMError(f"Failed to parse OpenAI JSON response: {json_err}", provider="openai") from json_err
+
+        choices = data.get("choices", [])
+        if not choices:
+            return LLMResponse(content="", finish_reason="stop")
+
+        choice = choices[0]
+        msg = choice.get("message", {})
+        content = msg.get("content")
+        finish_reason = choice.get("finish_reason", "stop")
+
+        parsed_tool_calls: List[ToolCallRequest] = []
+        raw_tool_calls = msg.get("tool_calls") or []
+        for tc in raw_tool_calls:
+            tc_id = tc.get("id") or f"call-{uuid.uuid4().hex[:8]}"
+            fn = tc.get("function", {})
+            fn_name = fn.get("name", "")
+            fn_args_raw = fn.get("arguments", "{}")
+            if isinstance(fn_args_raw, str):
+                try:
+                    fn_args = json.loads(fn_args_raw)
+                except Exception:
+                    fn_args = {}
+            elif isinstance(fn_args_raw, dict):
+                fn_args = fn_args_raw
+            else:
+                fn_args = {}
+            parsed_tool_calls.append(ToolCallRequest(id=tc_id, name=fn_name, arguments=fn_args))
+
+        # Build slot patch if single tool call was made
+        slot_patch: Optional[SlotPatch] = None
+        if len(parsed_tool_calls) == 1:
+            single_args = parsed_tool_calls[0].arguments
+            set_slots = {k: v for k, v in single_args.items() if v is not None and k not in ("delay_ms",)}
+            if set_slots:
+                slot_patch = SlotPatch(set_slots=set_slots)
+
+        return LLMResponse(
+            content=content,
+            tool_calls=parsed_tool_calls,
+            slot_patch=slot_patch,
+            finish_reason=finish_reason,
+        )
+
+
+# -----------------------------------------------------------------------------
+# LLM Client Factory
+# -----------------------------------------------------------------------------
+def create_llm_client(
+    provider_name: Optional[str] = None,
+    config: Optional[OpenAIConfig] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> BaseLLMClient:
+    """Factory creating an LLM client instance according to configuration."""
+    provider = (provider_name or os.getenv("VOICEFLOW_LLM_PROVIDER", "mock")).lower().strip()
+    if provider == "mock":
+        return MockLLMClient()
+    elif provider in ("openai", "real"):
+        cfg = config or OpenAIConfig.from_env()
+        cfg.validate_config(require_key=True)
+        return OpenAILLMClient(config=cfg, http_client=http_client, transport=transport)
+    else:
+        raise LLMConfigError(f"Unsupported LLM provider: '{provider}'. Supported: 'mock', 'openai'.")
+
 

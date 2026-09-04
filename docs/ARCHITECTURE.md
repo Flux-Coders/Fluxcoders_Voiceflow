@@ -274,7 +274,37 @@ All timing metrics use monotonic clock deltas (`time.perf_counter()`):
 
 ---
 
-## 9. Testing Architecture
+## 9. LLM Provider Architecture & Tool Calling Safety
+
+### Provider Abstraction & OpenAI Compatibility
+- **`BaseLLMClient`**: Abstract interface decoupled from state management, tool execution, and audio hardware.
+- **`MockLLMClient`**: Deterministic offline mock implementation supporting rule-based slot extraction, slot patching, and response synthesis.
+- **`OpenAILLMClient`**: Production OpenAI-compatible chat completions provider invoking `POST /chat/completions` via asynchronous `httpx.AsyncClient`.
+  - Configurable via `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_TEMPERATURE`, `OPENAI_TIMEOUT_SECONDS`.
+  - Secure credential handling: API keys are never logged, printed, or exposed in error messages.
+  - Supports standard OpenAI function calling tool schemas (`{"type": "function", "function": {...}}`).
+
+### Strict Tool Cardinality Enforcement
+The `LLMOrchestrator` deterministically evaluates returned tool calls with explicit cardinality rules:
+1. **0 tool calls**: Direct conversational response without tool execution (`Branch A`).
+2. **Exactly 1 tool call**: Authorized against `ToolRegistry.is_permitted()` and validated via Pydantic model (`TrainSearchParams`), then executed asynchronously (`Branch C`).
+3. **>1 tool calls**: Explicitly rejected as unsupported. Logs `TOOL_UNKNOWN_OR_FORBIDDEN` warning event, delivers user clarification ("Multiple simultaneous tool calls are not supported. Please make one request at a time."), and terminates turn safely without executing any tools (`Branch B`).
+
+### Typed Exception Hierarchy
+All provider-level errors are wrapped in typed domain exceptions:
+- `LLMError`: Base exception for all LLM errors.
+- `LLMConfigError`: Missing or invalid configuration (e.g. missing API key).
+- `LLMAuthenticationError`: HTTP 401/403 authentication failures.
+- `LLMBadRequestError`: HTTP 400 bad request.
+- `LLMRateLimitError`: HTTP 429 rate limit exceeded.
+- `LLMServerError`: HTTP 5xx upstream server errors.
+- `LLMTimeoutError`: Network request timeout.
+- `LLMConnectionError`: Network connection failure.
+- `LLMCancellationError`: Turn cancellation due to user interruption.
+
+---
+
+## 10. Testing Architecture
 
 In compliance with **Rule 9** ("Never hardcode performance metrics") and **Rule 10** ("Every realtime feature must have a failure test"):
 
@@ -298,7 +328,7 @@ In compliance with **Rule 9** ("Never hardcode performance metrics") and **Rule 
 
 ---
 
-## 10. Recommended Directory Structure
+## 11. Recommended Directory Structure
 
 ```
 Fluxcoders_VoiceFlow/
