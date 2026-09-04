@@ -18,7 +18,12 @@ import httpx
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 
-from app.engine.llm_provider import OpenAIConfig, OpenAILLMClient, LLMError
+from app.engine.llm_provider import (
+    LLMError,
+    LLMRateLimitError,
+    OpenAIConfig,
+    OpenAILLMClient,
+)
 from app.models import LLMMessage
 from app.tools.train_search import TRAIN_SEARCH_TOOL_SCHEMA
 
@@ -37,6 +42,85 @@ def load_env_vars() -> dict[str, str]:
                 if k_clean and v_clean:
                     loaded[k_clean] = v_clean
     return loaded
+
+
+async def diagnose_rate_limit(config: OpenAIConfig) -> dict[str, Any]:
+    """Inspects upstream 429 response to distinguish quota vs request/token limits without leaking secrets."""
+    url = f"{config.base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            status_code = resp.status_code
+            try:
+                body = resp.json()
+                err = body.get("error", {})
+                code = err.get("code")
+                err_type = err.get("type")
+                msg = err.get("message", "")
+            except Exception:
+                code = None
+                err_type = None
+                msg = resp.text[:200]
+
+            msg_lower = str(msg).lower()
+            code_str = str(code or "").lower()
+            type_str = str(err_type or "").lower()
+
+            if (
+                code_str == "insufficient_quota"
+                or type_str == "insufficient_quota"
+                or "quota" in msg_lower
+                or "billing" in msg_lower
+                or "credit" in msg_lower
+                or "plan" in msg_lower
+            ):
+                classification = "QUOTA_OR_BILLING_EXHAUSTED"
+                description = "Account has insufficient credits, unpaid invoices, or exceeded its hard monthly spending limit."
+                remediation = "Check your OpenAI account billing dashboard at https://platform.openai.com/usage or https://platform.openai.com/account/billing to verify credits and payment methods."
+            elif (
+                code_str == "rate_limit_exceeded"
+                or type_str in ("requests", "tokens")
+                or "requests per min" in msg_lower
+                or "tokens per min" in msg_lower
+                or "tpm" in msg_lower
+                or "rpm" in msg_lower
+            ):
+                classification = "TEMPORARY_RATE_LIMIT"
+                description = "Requests-per-minute (RPM) or Tokens-per-minute (TPM) threshold reached for this model tier."
+                remediation = "Wait a few seconds/minutes before making the next request, or request a tier limit increase."
+            else:
+                classification = "RATE_LIMIT_OTHER"
+                description = f"Upstream returned HTTP {status_code}."
+                remediation = "Inspect your organization / project limits on the provider platform."
+
+            return {
+                "status_code": status_code,
+                "error_code": code or "None",
+                "error_type": err_type or "None",
+                "message": msg or "No message provided",
+                "classification": classification,
+                "description": description,
+                "remediation": remediation,
+            }
+    except Exception as probe_err:
+        return {
+            "status_code": 429,
+            "error_code": "PROBE_FAILED",
+            "error_type": "None",
+            "message": str(probe_err),
+            "classification": "DIAGNOSTIC_PROBE_ERROR",
+            "description": "Unable to complete diagnostic HTTP probe.",
+            "remediation": "Verify network connectivity and base URL accessibility.",
+        }
 
 
 async def run_smoke_test() -> None:
@@ -100,8 +184,20 @@ async def run_smoke_test() -> None:
     except LLMError as e:
         latency_1_ms = (time.perf_counter() - t0) * 1000.0
         print(f"  --> Status        : FAILED ({e.__class__.__name__})")
+        print(f"  --> HTTP Status   : {e.status_code if e.status_code is not None else 'N/A'}")
         print(f"  --> Latency       : {latency_1_ms:.2f} ms")
         print(f"  --> Error Detail  : {e.message}")
+        if isinstance(e, LLMRateLimitError) or e.status_code == 429:
+            print("-" * 70)
+            print("  [DIAGNOSTIC: HTTP 429 RATE LIMIT CLASSIFICATION]")
+            diag = await diagnose_rate_limit(config)
+            print(f"  --> Upstream Status Code : {diag['status_code']}")
+            print(f"  --> Upstream Error Code  : {diag['error_code']}")
+            print(f"  --> Upstream Error Type  : {diag['error_type']}")
+            print(f"  --> Upstream Message     : {diag['message']}")
+            print(f"  --> Classification       : {diag['classification']}")
+            print(f"  --> Description          : {diag['description']}")
+            print(f"  --> Remediation Action   : {diag['remediation']}")
         print("=" * 70)
         return
     except Exception as e:
@@ -140,8 +236,20 @@ async def run_smoke_test() -> None:
     except LLMError as e:
         latency_2_ms = (time.perf_counter() - t1) * 1000.0
         print(f"  --> Status        : FAILED ({e.__class__.__name__})")
+        print(f"  --> HTTP Status   : {e.status_code if e.status_code is not None else 'N/A'}")
         print(f"  --> Latency       : {latency_2_ms:.2f} ms")
         print(f"  --> Error Detail  : {e.message}")
+        if isinstance(e, LLMRateLimitError) or e.status_code == 429:
+            print("-" * 70)
+            print("  [DIAGNOSTIC: HTTP 429 RATE LIMIT CLASSIFICATION]")
+            diag = await diagnose_rate_limit(config)
+            print(f"  --> Upstream Status Code : {diag['status_code']}")
+            print(f"  --> Upstream Error Code  : {diag['error_code']}")
+            print(f"  --> Upstream Error Type  : {diag['error_type']}")
+            print(f"  --> Upstream Message     : {diag['message']}")
+            print(f"  --> Classification       : {diag['classification']}")
+            print(f"  --> Description          : {diag['description']}")
+            print(f"  --> Remediation Action   : {diag['remediation']}")
     except Exception as e:
         print(f"  --> Unexpected Error: {type(e).__name__}: {e}")
 
