@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 import httpx
 
 # Ensure project root is in sys.path
@@ -21,6 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 from app.engine.llm_provider import (
     LLMError,
     LLMRateLimitError,
+    LLMServerError,
     OpenAIConfig,
     OpenAILLMClient,
 )
@@ -123,6 +125,106 @@ async def diagnose_rate_limit(config: OpenAIConfig) -> dict[str, Any]:
         }
 
 
+async def diagnose_server_error(
+    config: OpenAIConfig,
+    messages: Optional[List[LLMMessage]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Inspects upstream 503 / 5xx server error response to classify availability/overload without leaking secrets."""
+    url = f"{config.base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+    }
+    if messages:
+        formatted_messages = [
+            {"role": m.role, "content": m.content or ""} for m in messages
+        ]
+    else:
+        formatted_messages = [{"role": "user", "content": "Find trains from Nagpur to Mumbai tomorrow."}]
+
+    payload: Dict[str, Any] = {
+        "model": config.model,
+        "messages": formatted_messages,
+        "max_tokens": 50,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            status_code = resp.status_code
+            try:
+                body = resp.json()
+                err = body.get("error", {})
+                if isinstance(err, str):
+                    code = None
+                    err_type = None
+                    msg = err
+                elif isinstance(err, dict):
+                    code = err.get("code") or err.get("status")
+                    err_type = err.get("type") or err.get("status")
+                    msg = err.get("message", "")
+                else:
+                    code = None
+                    err_type = None
+                    msg = str(err)
+            except Exception:
+                code = None
+                err_type = None
+                msg = resp.text[:300]
+
+            msg_lower = str(msg).lower()
+            code_str = str(code or "").lower()
+            type_str = str(err_type or "").lower()
+
+            if (
+                "overloaded" in msg_lower
+                or "resource has been exhausted" in msg_lower
+                or "high demand" in msg_lower
+                or "capacity" in msg_lower
+                or code_str in ("unavailable", "503", "model_overloaded")
+                or type_str in ("unavailable", "server_error")
+            ):
+                classification = "PROVIDER_TEMPORARILY_UNAVAILABLE"
+                description = "The upstream AI model endpoint is experiencing transient high traffic, capacity limits, or backend overload."
+                remediation = "Transient model overload. Wait a few moments before retrying or use an alternate model/version."
+            elif "gateway" in msg_lower or "upstream" in msg_lower or status_code in (502, 504):
+                classification = "GATEWAY_OR_PROXY_ERROR"
+                description = "Upstream reverse proxy or API gateway timed out or failed to reach backend services."
+                remediation = "Verify endpoint URL and check upstream provider status page."
+            elif status_code == 200:
+                classification = "TRANSIENT_INTERMITTENT_ERROR (Subsequent probe succeeded with HTTP 200)"
+                description = "The initial request encountered a transient 503, but the immediate follow-up probe succeeded."
+                remediation = "Transient upstream condition. Re-running the request is likely to succeed."
+            else:
+                classification = "PROVIDER_SERVER_ERROR"
+                description = f"Upstream service returned HTTP {status_code}."
+                remediation = "Inspect upstream provider dashboard for service degradation or outages."
+
+            return {
+                "status_code": status_code,
+                "error_code": code or "None",
+                "error_type": err_type or "None",
+                "message": msg or "No message provided",
+                "classification": classification,
+                "description": description,
+                "remediation": remediation,
+            }
+    except Exception as probe_err:
+        return {
+            "status_code": 503,
+            "error_code": "PROBE_FAILED",
+            "error_type": "None",
+            "message": str(probe_err),
+            "classification": "DIAGNOSTIC_PROBE_ERROR",
+            "description": "Unable to complete diagnostic HTTP probe.",
+            "remediation": "Verify network connectivity and base URL accessibility.",
+        }
+
+
 async def run_smoke_test() -> None:
     env = load_env_vars()
 
@@ -198,12 +300,19 @@ async def run_smoke_test() -> None:
             print(f"  --> Classification       : {diag['classification']}")
             print(f"  --> Description          : {diag['description']}")
             print(f"  --> Remediation Action   : {diag['remediation']}")
-        print("=" * 70)
-        return
+        elif isinstance(e, LLMServerError) or (e.status_code and e.status_code >= 500):
+            print("-" * 70)
+            print("  [DIAGNOSTIC: HTTP 503/5XX SERVER ERROR CLASSIFICATION]")
+            diag = await diagnose_server_error(config, messages=messages_1)
+            print(f"  --> Upstream Status Code : {diag['status_code']}")
+            print(f"  --> Upstream Error Code  : {diag['error_code']}")
+            print(f"  --> Upstream Error Type  : {diag['error_type']}")
+            print(f"  --> Upstream Message     : {diag['message']}")
+            print(f"  --> Classification       : {diag['classification']}")
+            print(f"  --> Description          : {diag['description']}")
+            print(f"  --> Remediation Action   : {diag['remediation']}")
     except Exception as e:
         print(f"  --> Unexpected Error: {type(e).__name__}: {e}")
-        print("=" * 70)
-        return
 
     print("-" * 70)
 
@@ -250,6 +359,17 @@ async def run_smoke_test() -> None:
             print(f"  --> Classification       : {diag['classification']}")
             print(f"  --> Description          : {diag['description']}")
             print(f"  --> Remediation Action   : {diag['remediation']}")
+        elif isinstance(e, LLMServerError) or (e.status_code and e.status_code >= 500):
+            print("-" * 70)
+            print("  [DIAGNOSTIC: HTTP 503/5XX SERVER ERROR CLASSIFICATION]")
+            diag = await diagnose_server_error(config, messages=messages_2, tools=[TRAIN_SEARCH_TOOL_SCHEMA])
+            print(f"  --> Upstream Status Code : {diag['status_code']}")
+            print(f"  --> Upstream Error Code  : {diag['error_code']}")
+            print(f"  --> Upstream Error Type  : {diag['error_type']}")
+            print(f"  --> Upstream Message     : {diag['message']}")
+            print(f"  --> Classification       : {diag['classification']}")
+            print(f"  --> Description          : {diag['description']}")
+            print(f"  --> Remediation Action   : {diag['remediation']}")
     except Exception as e:
         print(f"  --> Unexpected Error: {type(e).__name__}: {e}")
 
@@ -260,4 +380,5 @@ async def run_smoke_test() -> None:
 
 if __name__ == "__main__":
     asyncio.run(run_smoke_test())
+
 
