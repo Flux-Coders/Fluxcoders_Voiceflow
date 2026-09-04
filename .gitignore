@@ -1,0 +1,23 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated audio
+backend/temp_audio/
+
+# Node
+node_modules/
+**/node_modules/
+
+# Frontend build
+dist/
+build/

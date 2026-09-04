@@ -68,44 +68,52 @@ VoiceFlow is an interruption-safe realtime voice agent designed for high-concurr
 
 The backend is built with Python using `asyncio` and `FastAPI` (integrating with the LiveKit Agents framework).
 
-### Key Subsystems & Modules
+#### Key Subsystems & Modules
 
 ```
 backend/
 ├── app/
 │   ├── core/
-│   │   ├── session.py          # SessionStateManager: atomic version & request tracking
+│   │   ├── session.py          # Session & SessionManager: atomic version, request lifecycle & turn orchestration
+│   │   ├── state.py            # ConversationStateManager: versioned state, history & SlotPatch application
 │   │   ├── cancellation.py     # CancellationToken & TaskRegistry
-│   │   └── config.py           # Environment, credentials, timeouts
+│   │   ├── tool_executor.py    # Asynchronous ToolExecutor with step cancellation checks & version gates
+│   │   ├── versioning.py       # RequestVersionGate: validation rules & version mismatch errors
+│   │   ├── rime_gate.py        # RimeTTSGate: strict version gate before speech synthesis
+│   │   ├── event_logger.py     # Structured domain telemetry logging
+│   │   └── metrics.py          # Dynamic time.perf_counter() latency measurements
 │   ├── engine/
-│   │   ├── orchestrator.py     # Central conversation loop & state machine
-│   │   ├── stt_stream.py       # STT stream handler & VAD trigger
-│   │   ├── llm_runner.py       # LLM streaming & tool call parsing
-│   │   └── audio_dispatcher.py # WebRTC audio frame scheduler & queue flush
-│   ├── tts/
-│   │   ├── base.py             # ITTSProvider interface
-│   │   └── rime_client.py      # Rime API client (streaming PCM/Opus chunks)
+│   │   ├── llm_orchestrator.py # LLMOrchestrator: Step 1 (intent/slot extraction), Tool dispatch & Step 2 (synthesis)
+│   │   └── llm_provider.py     # BaseLLMClient (abstract) & MockLLMClient (deterministic slot patching & synthesis)
 │   ├── tools/
-│   │   ├── base.py             # Tool base class with version validation
-│   │   └── train_search.py     # Mock train search with configurable delay
+│   │   ├── registry.py         # ToolRegistry: strict tool whitelist, permission check & Pydantic arg validation
+│   │   └── train_search.py     # Mock train search tool with configurable delay & OpenAPI schema
 │   └── api/
-│       ├── routes.py           # Health, session initialization, token dispatch
-│       └── websocket.py        # WebSocket fallback / control channel
+│       └── routes.py           # Health, session lifecycle & telemetry endpoints
 ```
 
 ### Module Responsibilities
-- **`SessionStateManager`**:
-  - Maintains `(active_request_id, active_version, conversation_history)`.
-  - Atomic version increment on new user turns.
-  - In-flight task handle registry for hard-cancellation.
-- **`STTStreamHandler`**:
-  - Processes incoming audio chunks; emits `SpeechStartedEvent` immediately upon voice detection, followed by `TranscriptEvent(interim/final)`.
-- **`LLMRunner`**:
-  - Generates token streams; detects tool calls; validates that every yielded token belongs to the `active_version`.
-- **`ToolExecutionWorker`**:
-  - Executes tool functions asynchronously; validates version at start and before returning results.
-- **`AudioDispatcher` & `RimeClient`**:
-  - Streams text chunks to Rime TTS API; pushes resulting audio chunks to WebRTC track; instantly discards pending chunks on interrupt.
+- **`Session` & `ConversationStateManager`**:
+  - Maintains `(active_request_id, active_version, conversation_history, slots)`.
+  - Atomic monotonic version increments on new user turns.
+  - Applies `SlotPatch` updates (adding, replacing, clearing constraints) strictly tied to `active_version`.
+- **`LLMOrchestrator`**:
+  - Step 1: Extracts intent/slots from user utterance, emits structured tool call if required slots exist, or prompts clarification.
+  - Intercepts cancellations before and after Step 1.
+  - Validates tool calls against `ToolRegistry` permissions and Pydantic argument models.
+  - Dispatches tool via `Session.run_tool()`.
+  - Step 2: Synthesizes natural language response from `TrainSearchResult`.
+  - Commits turn via atomic version gate `Session.complete_turn()`.
+- **`BaseLLMClient` & `MockLLMClient`**:
+  - Provider-agnostic abstraction for LLM inference.
+  - Completely isolated from audio hardware and TTS; cannot mutate state directly.
+  - Deterministically extracts slots, handles constraint replacements (e.g. "Only AC" -> "Sleeper is fine") and constraint clearing (e.g. "Only after 8 PM" -> "Any time is fine").
+- **`ToolRegistry`**:
+  - Enforces registration, permissions, and typed parameter validation for all callable tools.
+- **`ToolExecutor` & `RequestVersionGate`**:
+  - Executes tool functions asynchronously with 50ms cooperative cancellation checks; discards late results if version changed.
+- **`RimeTTSGate` & `MetricsCollector`**:
+  - Ensures only valid, active requests reach TTS. Measures latency dynamically via `time.perf_counter()`.
 
 ---
 
@@ -210,15 +218,59 @@ class RequestContext:
 
 ---
 
-## 8. Rime Integration Boundary
+## 8. Rime Integration Boundary & Three-Level Stale Protection
 
 In accordance with **Rule 1** and **Rule 12** ("Rime is the primary TTS provider. Do not replace Rime with another TTS provider in the primary flow"):
 
-### Interface Design
-- Abstract interface `ITTSProvider` defined in `backend/app/tts/base.py`.
-- Concrete implementation `RimeTTSProvider` defined in `backend/app/tts/rime_client.py`.
-- Consumes streaming text tokens from `LLMRunner` and produces streaming PCM/Opus audio chunks.
-- Supports proactive abort: when a cancellation signal fires, the ongoing HTTP chunked/WebSocket request to Rime is severed immediately to save bandwidth and compute.
+### Production Endpoint & Model Configuration
+- **API Endpoint**: `POST https://users.rime.ai/v1/rime-tts` (configurable via `RIME_ENDPOINT`).
+- **Production Model**: `mistv3` (configurable via `RIME_MODEL`, supports `mistv3`, `coda`, `mistv2`).
+- **Production Voice / Speaker**: `astra` (configurable via `RIME_SPEAKER`, supports `astra`, `celeste`, `marsh`, `amber`, etc.).
+- **Language Code**: `eng` (configurable via `RIME_LANGUAGE`).
+- **Audio Output Format**: `audio/pcm` (16-bit LE PCM at 16,000 Hz, configurable via `RIME_AUDIO_FORMAT` and `RIME_SAMPLE_RATE`).
+- **Transport**: Asynchronous HTTP chunked streaming using `httpx.AsyncClient` with `Transfer-Encoding: chunked`.
+- **Authentication**: `Authorization: Bearer <RIME_API_KEY>` loaded securely from environment (never hardcoded, logged, or exposed).
+
+### Three-Level Stale Protection Architecture
+
+```
+[Rime TTS HTTP Stream (POST /v1/rime-tts)]
+                   │
+                   ▼ (Raw audio chunks)
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Level 1: Rime Stream Gate (stream_synthesize)            │
+│    - Pre-flight check: (version == active_version)          │
+│    - In-stream check: on every raw chunk received           │
+│    - On cancel/stale: Immediately sever HTTP connection     │
+│      (response.aclose()), drop chunk & emit telemetry       │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼ (StreamedAudioChunk carrying request_id & version)
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Level 2: Audio Dispatcher Buffer Gate                    │
+│    - filter_buffered_chunks(): Inspects queued frames       │
+│    - If frame.version != active_version: Purge immediately  │
+│    - Log STALE_AUDIO_DISCARDED & StaleResultRecord          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼ (Validated frames)
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Level 3: Final Playback Gate (can_play_chunk)            │
+│    - Evaluated immediately before writing frame to speaker   │
+│      or WebRTC Opus track                                   │
+│    - If interrupted / version mismatch: Block playback      │
+│    - Emit AUDIO_OUTPUT_STOPPED                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Telemetry & Monotonic Instrumentation
+All timing metrics use monotonic clock deltas (`time.perf_counter()`):
+- `RIME_STREAM_STARTED`: Logs start time (`t_start`).
+- `RIME_FIRST_AUDIO_CHUNK`: Measures first-chunk audio latency `(t_first - t_start) * 1000`.
+- `RIME_CHUNK_RECEIVED`: Telemetry on every received chunk index and byte payload.
+- `RIME_STREAM_CANCELLED`: Logs cancellation timestamp (`t_cancel`) and chunks streamed before cut.
+- `RIME_STREAM_COMPLETED`: Total streaming duration `(t_complete - t_start) * 1000`.
+- `AUDIO_OUTPUT_STOPPED` & `STALE_AUDIO_DISCARDED`: Explicit stale drop audit log.
 
 ---
 
