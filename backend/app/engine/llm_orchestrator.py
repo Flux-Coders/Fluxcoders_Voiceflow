@@ -416,18 +416,26 @@ class LLMOrchestrator:
 
         # Append tool output to context messages
         synthesis_messages = list(messages)
+        call_id = tool_call.id or tool_task.task_id
         synthesis_messages.append(
             LLMMessage(
                 role="assistant",
                 content=None,
-                tool_calls=[ToolCallRequest(id=tool_task.task_id, name=tool_name, arguments=validated_args)],
+                tool_calls=[
+                    ToolCallRequest(
+                        id=call_id,
+                        name=tool_name,
+                        arguments=validated_args,
+                        extra_content=tool_call.extra_content,
+                    )
+                ],
             )
         )
         synthesis_messages.append(
             LLMMessage(
                 role="tool",
                 name=tool_name,
-                tool_call_id=tool_task.task_id,
+                tool_call_id=call_id,
                 content=json.dumps(tool_task.result if isinstance(tool_task.result, dict) else (tool_task.result.model_dump() if hasattr(tool_task.result, "model_dump") else tool_task.result)),
             )
         )

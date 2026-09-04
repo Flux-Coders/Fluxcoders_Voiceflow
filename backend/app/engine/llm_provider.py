@@ -489,8 +489,9 @@ class OpenAILLMClient(BaseLLMClient):
                 else:
                     m_dict["content"] = None
                 if msg.tool_calls:
-                    m_dict["tool_calls"] = [
-                        {
+                    tc_list: List[Dict[str, Any]] = []
+                    for tc in msg.tool_calls:
+                        tc_item: Dict[str, Any] = {
                             "id": tc.id or f"call-{uuid.uuid4().hex[:8]}",
                             "type": "function",
                             "function": {
@@ -498,8 +499,10 @@ class OpenAILLMClient(BaseLLMClient):
                                 "arguments": json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else (tc.arguments or "{}"),
                             },
                         }
-                        for tc in msg.tool_calls
-                    ]
+                        if tc.extra_content:
+                            tc_item["extra_content"] = tc.extra_content
+                        tc_list.append(tc_item)
+                    m_dict["tool_calls"] = tc_list
                 openai_messages.append(m_dict)
             elif msg.role == "tool":
                 openai_messages.append({
@@ -616,7 +619,8 @@ class OpenAILLMClient(BaseLLMClient):
                 fn_args = fn_args_raw
             else:
                 fn_args = {}
-            parsed_tool_calls.append(ToolCallRequest(id=tc_id, name=fn_name, arguments=fn_args))
+            extra_content = tc.get("extra_content")
+            parsed_tool_calls.append(ToolCallRequest(id=tc_id, name=fn_name, arguments=fn_args, extra_content=extra_content))
 
         # Build slot patch if single tool call was made
         slot_patch: Optional[SlotPatch] = None

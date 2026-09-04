@@ -199,6 +199,7 @@ class ToolCallRequest(BaseModel):
     id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:8]}")
     name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
+    extra_content: Optional[Dict[str, Any]] = None
 
 
 class LLMMessage(BaseModel):
