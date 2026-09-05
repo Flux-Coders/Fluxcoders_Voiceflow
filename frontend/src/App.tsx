@@ -50,6 +50,7 @@ export const App: React.FC = () => {
               micLevel={state.micLevel}
               isVadActive={state.isVadActive}
               agentStatus={state.agentStatus}
+              isLiveVoiceActive={state.isLiveVoiceActive}
             />
 
             {/* Req 3 & 4: Active Request & Version */}

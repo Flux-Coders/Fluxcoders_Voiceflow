@@ -7,12 +7,14 @@ interface MicrophoneStatusProps {
   micLevel: number;
   isVadActive: boolean;
   agentStatus: string;
+  isLiveVoiceActive?: boolean;
 }
 
 export const MicrophoneStatus: React.FC<MicrophoneStatusProps> = ({
   isMicActive,
   micLevel,
   agentStatus,
+  isLiveVoiceActive = false,
 }) => {
   // Generate visual bars for the equalizer
   const barCount = 18;
@@ -26,7 +28,7 @@ export const MicrophoneStatus: React.FC<MicrophoneStatusProps> = ({
 
   return (
     <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 shadow-sm">
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2">
           <div className={`p-1.5 rounded-lg ${isMicActive ? 'bg-cyan-500/10 text-cyan-400' : 'bg-rose-500/10 text-rose-400'}`}>
             {isMicActive ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
@@ -38,22 +40,43 @@ export const MicrophoneStatus: React.FC<MicrophoneStatusProps> = ({
             <div className="flex items-center gap-1.5">
               <span className={`w-2 h-2 rounded-full ${isMicActive ? 'bg-emerald-400 animate-ping' : 'bg-slate-500'}`} />
               <span className="text-sm font-semibold font-mono text-slate-200">
-                {isMicActive ? (agentStatus === 'listening' ? 'Vocalizing (VAD Active)' : 'Active / Monitoring') : 'Muted'}
+                {isLiveVoiceActive
+                  ? (agentStatus === 'listening' ? 'Live Voice: Vocalizing (VAD)' : 'Live Voice: Active & Listening')
+                  : (isMicActive ? (agentStatus === 'listening' ? 'Vocalizing (VAD Active)' : 'Active / Monitoring') : 'Muted')}
               </span>
             </div>
           </div>
         </div>
 
-        <button
-          onClick={() => simulationEngine.setMicActive(!isMicActive)}
-          className={`px-2.5 py-1 text-xs font-mono font-medium rounded-md border transition-all ${
-            isMicActive
-              ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
-              : 'bg-rose-950/40 text-rose-300 border-rose-800/60'
-          }`}
-        >
-          {isMicActive ? 'MUTE MIC' : 'UNMUTE MIC'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              if (isLiveVoiceActive) {
+                simulationEngine.disableLiveVoiceMode();
+              } else {
+                simulationEngine.enableLiveVoiceMode();
+              }
+            }}
+            className={`px-3 py-1 text-xs font-mono font-bold rounded-md border transition-all ${
+              isLiveVoiceActive
+                ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500 shadow-sm shadow-emerald-900/40'
+                : 'bg-cyan-950/70 hover:bg-cyan-900/80 text-cyan-300 border-cyan-700/60'
+            }`}
+          >
+            {isLiveVoiceActive ? 'LIVE VOICE ACTIVE (CLICK TO STOP)' : 'ENABLE LIVE VOICE (WEBAUDIO + STT)'}
+          </button>
+
+          <button
+            onClick={() => simulationEngine.setMicActive(!isMicActive)}
+            className={`px-2.5 py-1 text-xs font-mono font-medium rounded-md border transition-all ${
+              isMicActive
+                ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                : 'bg-rose-950/40 text-rose-300 border-rose-800/60'
+            }`}
+          >
+            {isMicActive ? 'MUTE MIC' : 'UNMUTE MIC'}
+          </button>
+        </div>
       </div>
 
       {/* Live Audio Level Meter & Waveform */}

@@ -38,6 +38,7 @@ export interface EngineState {
   mockToolDelayMs: number;
   simulationStep: string | null;
   isStressTesting: boolean;
+  isLiveVoiceActive: boolean;
 }
 
 class SimulationEngine {
@@ -57,8 +58,8 @@ class SimulationEngine {
       runningTools: [],
       rimeState: {
         status: 'idle',
-        currentSpeaker: 'Mist (Default Warm)',
-        model: 'rime-mist-v1',
+        currentSpeaker: 'Astra (Primary Live)',
+        model: 'mistv3',
         activeRequestId: null,
         activeVersion: null,
         bufferedChunks: [],
@@ -91,6 +92,7 @@ class SimulationEngine {
       mockToolDelayMs: 3000,
       simulationStep: null,
       isStressTesting: false,
+      isLiveVoiceActive: false,
     };
 
     this.startAudioVisualizerLoop();
@@ -169,8 +171,8 @@ class SimulationEngine {
     this.state.runningTools = [];
     this.state.rimeState = {
       status: 'idle',
-      currentSpeaker: 'Mist (Default Warm)',
-      model: 'rime-mist-v1',
+      currentSpeaker: 'Astra (Primary Live)',
+      model: 'mistv3',
       activeRequestId: null,
       activeVersion: null,
       bufferedChunks: [],
@@ -484,8 +486,8 @@ class SimulationEngine {
 
           this.state.rimeState = {
             status: 'playing',
-            currentSpeaker: 'Mist (Default Warm)',
-            model: 'rime-mist-v1',
+            currentSpeaker: 'Astra (Primary Live)',
+            model: 'mistv3',
             activeRequestId: req42,
             activeVersion: v42,
             bufferedChunks: rimeChunks,
@@ -584,8 +586,8 @@ class SimulationEngine {
 
           this.state.rimeState = {
             status: 'playing',
-            currentSpeaker: 'Mist',
-            model: 'rime-mist-v1',
+            currentSpeaker: 'Astra',
+            model: 'mistv3',
             activeRequestId: reqId,
             activeVersion: v,
             bufferedChunks: [{ chunkIndex: 1, sizeBytes: 14000, durationMs: 1200, textSnippet: 'Found 2 trains...', version: v, requestId: reqId, timestamp: Date.now() }],
@@ -687,8 +689,8 @@ class SimulationEngine {
 
           this.state.rimeState = {
             status: 'playing',
-            currentSpeaker: 'Mist',
-            model: 'rime-mist-v1',
+            currentSpeaker: 'Astra',
+            model: 'mistv3',
             activeRequestId: reqId,
             activeVersion: v,
             bufferedChunks: [{ chunkIndex: 1, sizeBytes: 12000, durationMs: 1000, textSnippet: 'Here is what I found...', version: v, requestId: reqId, timestamp: Date.now() }],
@@ -773,13 +775,13 @@ class SimulationEngine {
     // WebSocket Message Handling
     wsClient.onMessage((msg: WebSocketMessage) => {
       if (msg.type === 'STATE_SYNC') {
-        if (msg.active_version !== undefined) {
+        if (msg.active_version !== undefined && !this.state.isStressTesting) {
           this.state.activeVersion = msg.active_version;
         }
-        if (msg.active_request_id !== undefined) {
+        if (msg.active_request_id !== undefined && !this.state.isStressTesting) {
           this.state.activeRequestId = msg.active_request_id;
         }
-        if (msg.agent_status) {
+        if (msg.agent_status && !this.state.isStressTesting) {
           this.state.agentStatus = msg.agent_status;
         }
         this.notify();
@@ -794,6 +796,7 @@ class SimulationEngine {
       }
     });
 
+    this.state.isLiveVoiceActive = true;
     this.notify();
   }
 
@@ -806,6 +809,7 @@ class SimulationEngine {
     wsClient.disconnect();
     this.state.isMicActive = false;
     this.state.isVadActive = false;
+    this.state.isLiveVoiceActive = false;
     this.notify();
   }
 }
