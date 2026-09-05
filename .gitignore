@@ -21,6 +21,8 @@ node_modules/
 # Frontend build
 dist/
 build/
+**/dist/
+**/build/
 
 # Editor
 .vscode/

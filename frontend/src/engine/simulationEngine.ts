@@ -8,6 +8,9 @@ import {
   LatencyMetrics, 
   TranscriptMessage 
 } from '../types';
+import { audioEngine } from './audioEngine';
+import { speechRecognition } from './speechRecognition';
+import { wsClient, WebSocketMessage } from './websocketClient';
 
 export type StateListener = (state: EngineState) => void;
 
@@ -716,6 +719,93 @@ class SimulationEngine {
       }, this.state.mockToolDelayMs);
     }, 400);
 
+    this.notify();
+  }
+
+  /**
+   * Enables live microphone, browser speech recognition, and WebSocket backend connection.
+   */
+  public async enableLiveVoiceMode(): Promise<void> {
+    wsClient.connect('live-session');
+
+    try {
+      await audioEngine.startMicrophone();
+      this.state.isMicActive = true;
+    } catch (err) {
+      console.warn('Microphone permission denied or unavailable:', err);
+      this.state.isMicActive = false;
+    }
+
+    // Audio Engine Callbacks
+    audioEngine.onSpeechStart(() => {
+      this.state.isVadActive = true;
+      if (this.state.agentStatus === 'speaking' || this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running') {
+        audioEngine.fastMuteOutput();
+        this.interrupt('Live VAD user speech detected');
+        wsClient.sendSpeechStarted(this.state.activeVersion);
+      }
+      this.notify();
+    });
+
+    audioEngine.onSpeechEnd(() => {
+      this.state.isVadActive = false;
+      this.notify();
+    });
+
+    audioEngine.onMicLevel((level) => {
+      this.state.micLevel = level;
+      this.notify();
+    });
+
+    // Speech Recognition Callbacks
+    if (speechRecognition.isSupported()) {
+      speechRecognition.onInterim((text) => {
+        wsClient.sendInterimTranscript(text, this.state.activeVersion);
+      });
+
+      speechRecognition.onFinal((text) => {
+        wsClient.sendFinalTranscript(text, this.state.activeVersion);
+      });
+
+      speechRecognition.start();
+    }
+
+    // WebSocket Message Handling
+    wsClient.onMessage((msg: WebSocketMessage) => {
+      if (msg.type === 'STATE_SYNC') {
+        if (msg.active_version !== undefined) {
+          this.state.activeVersion = msg.active_version;
+        }
+        if (msg.active_request_id !== undefined) {
+          this.state.activeRequestId = msg.active_request_id;
+        }
+        if (msg.agent_status) {
+          this.state.agentStatus = msg.agent_status;
+        }
+        this.notify();
+      } else if (msg.type === 'RIME_AUDIO_CHUNK') {
+        if (msg.audio_base64 && msg.version === this.state.activeVersion) {
+          audioEngine.playAudioChunk(msg.audio_base64, msg.version, this.state.activeVersion);
+        }
+      } else if (msg.type === 'STALE_DISCARD_EVENT') {
+        this.state.metrics.staleRejectionCount += 1;
+        this.addEvent('TOOL_RETURN_STALE_DISCARDED', msg.version, msg.request_id, `Stale turn result rejected by VersionGate: ${msg.reason}`, 'warn');
+        this.notify();
+      }
+    });
+
+    this.notify();
+  }
+
+  /**
+   * Disables live voice mode and disconnects hardware.
+   */
+  public disableLiveVoiceMode(): void {
+    audioEngine.stopMicrophone();
+    speechRecognition.stop();
+    wsClient.disconnect();
+    this.state.isMicActive = false;
+    this.state.isVadActive = false;
     this.notify();
   }
 }

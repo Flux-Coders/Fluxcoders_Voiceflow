@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.models import ConversationState, EventLevel, Request, ToolTask, VoiceEvent
 from app.core.metrics import VoiceMetricsSnapshot
 from app.core.session import SessionManager
+from app.api.websocket import router as websocket_router
 
 app = FastAPI(
     title="VoiceFlow Backend API",
@@ -25,6 +26,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(websocket_router)
 
 session_manager = SessionManager()
 
