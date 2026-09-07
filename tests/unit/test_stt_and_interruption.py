@@ -165,8 +165,14 @@ def test_websocket_endpoint_connection_and_protocol():
         assert interim_res["type"] == "TRANSCRIPT_INTERIM"
         assert interim_res["text"] == "Looking for"
 
-        # 4. Speech started / barge-in test
-        ws.send_json({"type": "SPEECH_STARTED", "reason": "Barge-in detected"})
+        # 4. Speech started telemetry test
+        ws.send_json({"type": "SPEECH_STARTED", "active_version": 0})
+        speech_ack = ws.receive_json()
+        assert speech_ack["type"] == "SPEECH_ACKNOWLEDGED"
+        assert speech_ack["session_id"] == "sess-ws-test"
+
+        # 5. Client explicit barge-in interrupt test
+        ws.send_json({"type": "CLIENT_INTERRUPT", "reason": "Barge-in detected", "active_version": 0})
         ack = ws.receive_json()
         assert ack["type"] == "INTERRUPT_ACKNOWLEDGED"
         assert ack["session_id"] == "sess-ws-test"

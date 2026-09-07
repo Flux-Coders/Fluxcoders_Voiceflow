@@ -17,13 +17,17 @@ export class BrowserSpeechRecognition {
   private isListening: boolean = false;
   private shouldRestart: boolean = false;
 
+  private accumulatedText: string = '';
+  private endpointTimerId: number | null = null;
+  private silenceEndpointMs: number = 650;
+
   private onInterimCallbacks: Array<(text: string) => void> = [];
   private onFinalCallbacks: Array<(text: string) => void> = [];
   private onStartCallbacks: Array<() => void> = [];
   private onEndCallbacks: Array<() => void> = [];
   private onErrorCallbacks: Array<(error: string) => void> = [];
 
-  constructor(config?: Partial<SpeechRecognitionConfig>) {
+  constructor(config?: Partial<SpeechRecognitionConfig> & { silenceEndpointMs?: number }) {
     const SpeechRecognitionClass =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
@@ -33,6 +37,9 @@ export class BrowserSpeechRecognition {
       this.recognition.continuous = config?.continuous !== undefined ? config.continuous : true;
       this.recognition.interimResults = config?.interimResults !== undefined ? config.interimResults : true;
       this.recognition.maxAlternatives = config?.maxAlternatives || 1;
+      if (config?.silenceEndpointMs) {
+        this.silenceEndpointMs = config.silenceEndpointMs;
+      }
 
       this.setupHandlers();
     }
@@ -40,6 +47,39 @@ export class BrowserSpeechRecognition {
 
   public isSupported(): boolean {
     return this.recognition !== null;
+  }
+
+  public setSilenceEndpointMs(ms: number): void {
+    this.silenceEndpointMs = ms;
+  }
+
+  public clearPendingUtterance(): void {
+    if (this.endpointTimerId) {
+      window.clearTimeout(this.endpointTimerId);
+      this.endpointTimerId = null;
+    }
+    this.accumulatedText = '';
+  }
+
+  public commitPendingUtteranceNow(): void {
+    if (this.endpointTimerId) {
+      window.clearTimeout(this.endpointTimerId);
+      this.endpointTimerId = null;
+    }
+    const textToCommit = this.accumulatedText.trim();
+    if (textToCommit) {
+      this.accumulatedText = '';
+      this.onFinalCallbacks.forEach((cb) => cb(textToCommit));
+    }
+  }
+
+  private resetEndpointTimer(): void {
+    if (this.endpointTimerId) {
+      window.clearTimeout(this.endpointTimerId);
+    }
+    this.endpointTimerId = window.setTimeout(() => {
+      this.commitPendingUtteranceNow();
+    }, this.silenceEndpointMs);
   }
 
   private setupHandlers(): void {
@@ -52,24 +92,28 @@ export class BrowserSpeechRecognition {
 
     this.recognition.onresult = (event: any) => {
       let interimText = '';
-      let finalText = '';
+      let segmentFinalText = '';
 
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         const result = event.results[i];
         const transcript = result[0]?.transcript || '';
         if (result.isFinal) {
-          finalText += transcript;
+          segmentFinalText += (segmentFinalText ? ' ' : '') + transcript;
         } else {
-          interimText += transcript;
+          interimText += (interimText ? ' ' : '') + transcript;
         }
       }
 
-      if (interimText.trim()) {
-        this.onInterimCallbacks.forEach((cb) => cb(interimText.trim()));
+      // Coalesce final segment into the accumulated utterance
+      if (segmentFinalText.trim()) {
+        this.accumulatedText = (this.accumulatedText + ' ' + segmentFinalText).trim();
       }
 
-      if (finalText.trim()) {
-        this.onFinalCallbacks.forEach((cb) => cb(finalText.trim()));
+      // Emit full display interim (accumulated final text + current active interim segment)
+      const fullDisplayInterim = (this.accumulatedText + ' ' + interimText).trim();
+      if (fullDisplayInterim) {
+        this.onInterimCallbacks.forEach((cb) => cb(fullDisplayInterim));
+        this.resetEndpointTimer();
       }
     };
 
@@ -84,6 +128,11 @@ export class BrowserSpeechRecognition {
     this.recognition.onend = () => {
       this.isListening = false;
       this.onEndCallbacks.forEach((cb) => cb());
+
+      // If recognition ends and there is accumulated speech, commit it
+      if (this.accumulatedText.trim()) {
+        this.commitPendingUtteranceNow();
+      }
 
       // Auto-restart if microphone is meant to stay continuous
       if (this.shouldRestart) {

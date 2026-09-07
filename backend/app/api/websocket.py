@@ -209,10 +209,10 @@ async def session_websocket_endpoint(
             msg_type = msg.get("type", "").upper()
 
             # -------------------------------------------------------------
-            # Event 1: SPEECH_STARTED / CLIENT_INTERRUPT (Barge-In)
+            # Event 1A: CLIENT_INTERRUPT (Explicit Barge-In Command)
             # -------------------------------------------------------------
-            if msg_type in ("SPEECH_STARTED", "CLIENT_INTERRUPT"):
-                reason = msg.get("reason", "User voice detected")
+            if msg_type == "CLIENT_INTERRUPT":
+                reason = msg.get("reason", "User voice barge-in")
                 interrupt_result = session.interrupt(reason=reason)
 
                 # Cancel active backend turn task immediately
@@ -229,6 +229,20 @@ async def session_websocket_endpoint(
                     },
                 )
                 await ws_manager.broadcast_state_sync(session=session, agent_status="listening")
+
+            # -------------------------------------------------------------
+            # Event 1B: SPEECH_STARTED (Speech Onset / Activity Telemetry)
+            # -------------------------------------------------------------
+            elif msg_type == "SPEECH_STARTED":
+                # Speech onset notification: does not cancel in-flight turn tasks unless CLIENT_INTERRUPT is sent
+                await ws_manager.send_json(
+                    session_id,
+                    {
+                        "type": "SPEECH_ACKNOWLEDGED",
+                        "session_id": session_id,
+                        "active_version": session.active_version,
+                    },
+                )
 
             # -------------------------------------------------------------
             # Event 2: INTERIM_TRANSCRIPT (Live Visual Feedback Only)

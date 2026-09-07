@@ -45,6 +45,7 @@ class SimulationEngine {
   private state: EngineState;
   private listeners: Set<StateListener> = new Set();
   private runningTimeouts: number[] = [];
+  private isUtteranceInProgress: boolean = false;
 
   constructor() {
     this.state = {
@@ -164,6 +165,8 @@ class SimulationEngine {
 
   public resetSession() {
     this.clearTimeouts();
+    speechRecognition.clearPendingUtterance();
+    this.isUtteranceInProgress = false;
     this.state.agentStatus = 'idle';
     this.state.activeVersion = 40;
     this.state.activeRequestId = null;
@@ -202,6 +205,8 @@ class SimulationEngine {
    * Can be invoked manually by clicking 'Interrupt' or programmatically by scenarios.
    */
   public interrupt(reason: string = 'User spoken interruption') {
+    speechRecognition.clearPendingUtterance();
+    this.isUtteranceInProgress = false;
     const tInterruptStart = performance.now();
     const prevVersion = this.state.activeVersion;
     const prevReqId = this.state.activeRequestId;
@@ -741,9 +746,24 @@ class SimulationEngine {
     // Audio Engine Callbacks
     audioEngine.onSpeechStart(() => {
       this.state.isVadActive = true;
-      if (this.state.agentStatus === 'speaking' || this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running') {
+
+      const isSpeaking = this.state.agentStatus === 'speaking' || this.state.rimeState.status === 'playing';
+      const isProcessingPreviousUtterance =
+        (this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running') &&
+        !this.isUtteranceInProgress;
+
+      if (isSpeaking || isProcessingPreviousUtterance) {
+        // Genuine barge-in while previous turn was active/speaking
         audioEngine.fastMuteOutput();
-        this.interrupt('Live VAD user speech detected');
+        this.interrupt('Live VAD user barge-in detected');
+        wsClient.sendInterrupt('Live VAD user barge-in detected', this.state.activeVersion);
+        this.isUtteranceInProgress = true;
+      } else {
+        // Normal speech onset / continuation of current utterance
+        if (this.state.agentStatus === 'idle') {
+          this.state.agentStatus = 'listening';
+        }
+        this.isUtteranceInProgress = true;
         wsClient.sendSpeechStarted(this.state.activeVersion);
       }
       this.notify();
@@ -762,10 +782,12 @@ class SimulationEngine {
     // Speech Recognition Callbacks
     if (speechRecognition.isSupported()) {
       speechRecognition.onInterim((text) => {
+        this.isUtteranceInProgress = true;
         wsClient.sendInterimTranscript(text, this.state.activeVersion);
       });
 
       speechRecognition.onFinal((text) => {
+        this.isUtteranceInProgress = false;
         wsClient.sendFinalTranscript(text, this.state.activeVersion);
       });
 
@@ -806,6 +828,8 @@ class SimulationEngine {
   public disableLiveVoiceMode(): void {
     audioEngine.stopMicrophone();
     speechRecognition.stop();
+    speechRecognition.clearPendingUtterance();
+    this.isUtteranceInProgress = false;
     wsClient.disconnect();
     this.state.isMicActive = false;
     this.state.isVadActive = false;

@@ -29,7 +29,7 @@ export class AudioEngine {
 
   private vadConfig: VADConfig = {
     energyThreshold: 0.015,
-    holdTimeMs: 150,
+    holdTimeMs: 400,
   };
 
   /**
@@ -134,8 +134,7 @@ export class AudioEngine {
         if (!this.isVadSpeaking) {
           this.isVadSpeaking = true;
           this.vadSpeechStartTime = now;
-          // Trigger Fast-Path Mute & Speech Start
-          this.fastMuteOutput();
+          // Notify speech onset listeners ONLY (do not unconditionally mute here)
           this.onSpeechStartCallbacks.forEach((cb) => cb());
         }
       } else {
@@ -167,11 +166,15 @@ export class AudioEngine {
     }
   }
 
+  public getIsMuted(): boolean {
+    return this.isMuted;
+  }
+
   /**
    * Plays a decoded Rime audio chunk if its version matches the active version.
    */
   public async playAudioChunk(audioBase64: string, chunkVersion: number, activeVersion: number): Promise<void> {
-    if (chunkVersion !== activeVersion || this.isMuted) {
+    if (chunkVersion !== activeVersion) {
       // Stale audio chunk dropped before playback (Level 3 Gate)
       return;
     }
@@ -190,10 +193,11 @@ export class AudioEngine {
       const audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer);
 
       // Check version again after asynchronous decode
-      if (chunkVersion !== activeVersion || this.isMuted) {
+      if (chunkVersion !== activeVersion) {
         return;
       }
 
+      // Unmute for active version playback
       this.unmuteOutput();
       const source = this.audioCtx.createBufferSource();
       source.buffer = audioBuffer;
