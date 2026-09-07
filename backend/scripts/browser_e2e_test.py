@@ -222,7 +222,60 @@ async def run_browser_e2e_validation() -> None:
         print(f"  --> Saved Initial Screenshot: {initial_shot.name}", flush=True)
 
         # ---------------------------------------------------------------------
-        # STEP 1: Turn 1 ("Find me a train from Nagpur to Mumbai tomorrow.")
+        # STEP 1A: Validate VAD Turn Endpointing (No playback while VAD active)
+        # ---------------------------------------------------------------------
+        print(f"\n[3.5/6] Testing VAD-Gated Endpointing (Rime must NOT start while VAD is active)...", flush=True)
+        vad_gate_check = await cdp.evaluate("""
+            (() => {
+                const engine = window.simulationEngine;
+                const sr = window.speechRecognition;
+                const audio = window.audioEngine;
+
+                // 1. User starts speaking (VAD active)
+                audio.isVadSpeaking = true;
+                if (audio.onSpeechStartCallbacks) audio.onSpeechStartCallbacks.forEach(cb => cb());
+
+                // 2. Chrome emits first isFinal segment
+                if (sr.recognition && sr.recognition.onresult) {
+                    sr.recognition.onresult({
+                        resultIndex: 0,
+                        results: [Object.assign([{ transcript: 'Find me a train' }], { isFinal: true })]
+                    });
+                }
+
+                // 3. Attempt to commit while VAD is still active
+                sr.commitPendingUtteranceNow();
+
+                // 4. Assert that turn was NOT committed and Rime is NOT playing
+                const blockedPrematureCommit = (engine.state.agentStatus !== 'speaking' && engine.state.rimeState.status !== 'playing');
+
+                // 5. User speaks second segment
+                if (sr.recognition && sr.recognition.onresult) {
+                    sr.recognition.onresult({
+                        resultIndex: 0,
+                        results: [Object.assign([{ transcript: 'from Nagpur to Mumbai tomorrow' }], { isFinal: true })]
+                    });
+                }
+
+                // 6. User finishes speaking
+                audio.isVadSpeaking = false;
+                if (audio.onSpeechEndCallbacks) audio.onSpeechEndCallbacks.forEach(cb => cb());
+
+                return {
+                    blockedPrematureCommit: blockedPrematureCommit,
+                    accumulatedText: sr.accumulatedText,
+                    currentUtteranceText: sr.currentUtteranceText,
+                    rimeStatus: engine.state.rimeState.status
+                };
+            })()
+        """)
+        print(f"  --> VAD Gate Check Result: {vad_gate_check}", flush=True)
+        assert vad_gate_check["blockedPrematureCommit"], "ERROR: Premature request or Rime playback occurred while VAD was active!"
+        assert "Nagpur to Mumbai tomorrow" in (vad_gate_check["accumulatedText"] or vad_gate_check["currentUtteranceText"]), "ERROR: Utterance was not coalesced!"
+        print("  [PASS] Rime playback blocked while user is speaking (VAD-gated turn endpointing verified)", flush=True)
+
+        # ---------------------------------------------------------------------
+        # STEP 1B: Turn 1 ("Find me a train from Nagpur to Mumbai tomorrow.")
         # ---------------------------------------------------------------------
         turn1_prompt = "Find me a train from Nagpur to Mumbai tomorrow."
         print(f"\n[4/6] Executing Turn 1 Utterance: \"{turn1_prompt}\"", flush=True)

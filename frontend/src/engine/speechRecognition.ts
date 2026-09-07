@@ -18,8 +18,10 @@ export class BrowserSpeechRecognition {
   private shouldRestart: boolean = false;
 
   private accumulatedText: string = '';
+  private currentUtteranceText: string = '';
   private endpointTimerId: number | null = null;
   private silenceEndpointMs: number = 650;
+  private isVadActiveProvider: (() => boolean) | null = null;
 
   private onInterimCallbacks: Array<(text: string) => void> = [];
   private onFinalCallbacks: Array<(text: string) => void> = [];
@@ -49,8 +51,38 @@ export class BrowserSpeechRecognition {
     return this.recognition !== null;
   }
 
+  public setVadActiveProvider(provider: () => boolean): void {
+    this.isVadActiveProvider = provider;
+  }
+
+  public isVadActive(): boolean {
+    return this.isVadActiveProvider ? this.isVadActiveProvider() : false;
+  }
+
   public setSilenceEndpointMs(ms: number): void {
     this.silenceEndpointMs = ms;
+  }
+
+  /**
+   * Called when local VAD detects speech onset.
+   * Cancels any pending silence endpoint timer so speaking is not prematurely committed.
+   */
+  public onVadSpeechStart(): void {
+    if (this.endpointTimerId) {
+      window.clearTimeout(this.endpointTimerId);
+      this.endpointTimerId = null;
+    }
+  }
+
+  /**
+   * Called when local VAD detects speech end (hold time elapsed).
+   * Starts the silence endpoint timer to commit the accumulated utterance after silence.
+   */
+  public onVadSpeechEnd(): void {
+    const text = (this.currentUtteranceText || this.accumulatedText).trim();
+    if (text) {
+      this.resetEndpointTimer();
+    }
   }
 
   public clearPendingUtterance(): void {
@@ -59,6 +91,7 @@ export class BrowserSpeechRecognition {
       this.endpointTimerId = null;
     }
     this.accumulatedText = '';
+    this.currentUtteranceText = '';
   }
 
   public commitPendingUtteranceNow(): void {
@@ -66,9 +99,16 @@ export class BrowserSpeechRecognition {
       window.clearTimeout(this.endpointTimerId);
       this.endpointTimerId = null;
     }
-    const textToCommit = this.accumulatedText.trim();
+
+    // Do NOT commit if user is still actively speaking according to VAD
+    if (this.isVadActive()) {
+      return;
+    }
+
+    const textToCommit = (this.currentUtteranceText || this.accumulatedText).trim();
     if (textToCommit) {
       this.accumulatedText = '';
+      this.currentUtteranceText = '';
       this.onFinalCallbacks.forEach((cb) => cb(textToCommit));
     }
   }
@@ -104,16 +144,27 @@ export class BrowserSpeechRecognition {
         }
       }
 
-      // Coalesce final segment into the accumulated utterance
+      // Coalesce final recognition segment into accumulated utterance buffer
       if (segmentFinalText.trim()) {
         this.accumulatedText = (this.accumulatedText + ' ' + segmentFinalText).trim();
       }
 
-      // Emit full display interim (accumulated final text + current active interim segment)
+      // Emit full display interim (accumulated text + current active interim segment)
       const fullDisplayInterim = (this.accumulatedText + ' ' + interimText).trim();
       if (fullDisplayInterim) {
+        this.currentUtteranceText = fullDisplayInterim;
         this.onInterimCallbacks.forEach((cb) => cb(fullDisplayInterim));
-        this.resetEndpointTimer();
+
+        if (this.isVadActive()) {
+          // User is actively speaking: cancel any pending silence endpoint timer
+          if (this.endpointTimerId) {
+            window.clearTimeout(this.endpointTimerId);
+            this.endpointTimerId = null;
+          }
+        } else {
+          // If VAD is already ended or not active, arm the silence timer
+          this.resetEndpointTimer();
+        }
       }
     };
 
@@ -129,9 +180,12 @@ export class BrowserSpeechRecognition {
       this.isListening = false;
       this.onEndCallbacks.forEach((cb) => cb());
 
-      // If recognition ends and there is accumulated speech, commit it
-      if (this.accumulatedText.trim()) {
-        this.commitPendingUtteranceNow();
+      // If user is not actively speaking and there is buffered speech, arm endpoint timer
+      if (!this.isVadActive()) {
+        const textToCommit = (this.currentUtteranceText || this.accumulatedText).trim();
+        if (textToCommit && !this.endpointTimerId) {
+          this.resetEndpointTimer();
+        }
       }
 
       // Auto-restart if microphone is meant to stay continuous

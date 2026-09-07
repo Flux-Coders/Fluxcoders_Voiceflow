@@ -743,9 +743,12 @@ class SimulationEngine {
       this.state.isMicActive = false;
     }
 
-    // Audio Engine Callbacks
+    // Audio Engine Callbacks & VAD Synchronization
+    speechRecognition.setVadActiveProvider(() => audioEngine.getIsVadSpeaking());
+
     audioEngine.onSpeechStart(() => {
       this.state.isVadActive = true;
+      speechRecognition.onVadSpeechStart();
 
       const isSpeaking = this.state.agentStatus === 'speaking' || this.state.rimeState.status === 'playing';
 
@@ -767,6 +770,7 @@ class SimulationEngine {
 
     audioEngine.onSpeechEnd(() => {
       this.state.isVadActive = false;
+      speechRecognition.onVadSpeechEnd();
       this.notify();
     });
 
@@ -822,10 +826,35 @@ class SimulationEngine {
         }
         if (msg.agent_status && !this.state.isStressTesting) {
           this.state.agentStatus = msg.agent_status;
+          if (msg.agent_status === 'idle' && this.state.rimeState.status === 'playing') {
+            this.state.rimeState.status = 'idle';
+          }
+        }
+        if (msg.extra?.assistant_response && !this.state.isStressTesting) {
+          const alreadyAdded = this.state.transcript.some(
+            (t) => t.role === 'assistant' && t.version === this.state.activeVersion && t.text === msg.extra.assistant_response
+          );
+          if (!alreadyAdded) {
+            this.state.transcript = [
+              ...this.state.transcript,
+              {
+                id: `msg-${Date.now()}`,
+                role: 'assistant',
+                text: msg.extra.assistant_response,
+                version: this.state.activeVersion,
+                requestId: this.state.activeRequestId || `req-${this.state.activeVersion}`,
+                timestamp: Date.now(),
+              },
+            ];
+          }
         }
         this.notify();
       } else if (msg.type === 'RIME_AUDIO_CHUNK') {
         if (msg.audio_base64 && msg.version === this.state.activeVersion) {
+          this.state.rimeState.status = 'playing';
+          this.state.rimeState.activeRequestId = msg.request_id || this.state.activeRequestId;
+          this.state.rimeState.activeVersion = msg.version;
+          this.notify();
           audioEngine.playAudioChunk(msg.audio_base64, msg.version, this.state.activeVersion);
         }
       } else if (msg.type === 'STALE_DISCARD_EVENT') {

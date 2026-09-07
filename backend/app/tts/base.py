@@ -34,6 +34,10 @@ class StreamedAudioChunk(BaseModel):
     def version(self) -> int:
         return self.conversation_version
 
+    @property
+    def audio_bytes(self) -> bytes:
+        return self.data
+
 
 class BaseTTSClient(ABC):
     """Abstract interface for all Text-to-Speech clients."""

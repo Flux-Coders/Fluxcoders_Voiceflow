@@ -136,6 +136,7 @@ async def session_websocket_endpoint(
             )
 
             # Check if this request is still active
+            print(f"[WS-DEBUG] Turn result success={result.success}, is_stale={result.is_stale}, resp={result.assistant_response[:30] if result.assistant_response else None}, active_v={session.active_version}, req_v={version}", flush=True)
             if session.active_version != version or result.is_stale:
                 await ws_manager.send_json(
                     session_id,
@@ -149,7 +150,7 @@ async def session_websocket_endpoint(
                 await ws_manager.broadcast_state_sync(session=session, agent_status="idle")
                 return
 
-            if result.success and result.assistant_response:
+            if result.assistant_response:
                 # 3. Stream Rime TTS chunks to client
                 await ws_manager.broadcast_state_sync(
                     session=session,
@@ -160,6 +161,7 @@ async def session_websocket_endpoint(
                 try:
                     token = session.task_registry.get_token(req_id)
                     chunk_idx = 0
+                    print(f"[WS-DEBUG] Starting Rime synthesis for text: {result.assistant_response[:30]}", flush=True)
                     async for chunk in session.rime_gate.stream_synthesize(
                         text=result.assistant_response,
                         request_id=req_id,
@@ -171,9 +173,12 @@ async def session_websocket_endpoint(
                     ):
                         # Verify version is still active before sending chunk
                         if session.active_version != version or (token and token.is_cancelled):
+                            print(f"[WS-DEBUG] Chunk dropped: active_v={session.active_version}, req_v={version}", flush=True)
                             break
 
-                        audio_b64 = base64.b64encode(chunk.audio_bytes).decode("ascii")
+                        audio_data = getattr(chunk, "audio_bytes", None) or getattr(chunk, "data", b"")
+                        audio_b64 = base64.b64encode(audio_data).decode("ascii")
+                        print(f"[WS-DEBUG] Sending RIME_AUDIO_CHUNK #{chunk_idx} ({len(audio_data)} bytes)", flush=True)
                         await ws_manager.send_json(
                             session_id,
                             {
@@ -187,9 +192,11 @@ async def session_websocket_endpoint(
                         )
                         chunk_idx += 1
                 except Exception as tts_err:
+                    print(f"[WS-DEBUG] TTS Stream Error: {type(tts_err).__name__}: {tts_err}", flush=True)
                     logger.warning("Rime TTS stream error: %s", tts_err)
 
             # Turn completed normally
+            print(f"[WS-DEBUG] Turn completed normally. Broadcasting idle.", flush=True)
             await ws_manager.broadcast_state_sync(session=session, agent_status="idle")
 
         except asyncio.CancelledError:

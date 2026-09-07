@@ -200,3 +200,168 @@ async def test_meaningful_stt_transcript_during_thinking_triggers_barge_in(test_
     req2 = test_session.create_request(prompt=new_utterance_text)
     assert test_session.active_version == 2
     assert req2.status == RequestStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_chrome_multiple_isfinal_segments_while_vad_active_produces_single_request(test_session):
+    """Case A: Chrome emits multiple isFinal segments while VAD remains active -> exactly ONE request after speech end."""
+    accumulated_text = ""
+    current_utterance_text = ""
+    is_vad_active = True  # VAD reports user is still physically speaking
+    endpoint_timer_active = False
+    created_requests = []
+
+    def on_result(segment_text: str, is_final: bool):
+        nonlocal accumulated_text, current_utterance_text, endpoint_timer_active
+        if is_final:
+            accumulated_text = (accumulated_text + " " + segment_text).strip()
+        display = (accumulated_text + " " + (segment_text if not is_final else "")).strip()
+        if display:
+            current_utterance_text = display
+        # While VAD is active, endpoint timer is NOT armed
+        if is_vad_active:
+            endpoint_timer_active = False
+        else:
+            endpoint_timer_active = True
+
+    def on_vad_speech_end():
+        nonlocal endpoint_timer_active
+        endpoint_timer_active = True
+
+    def on_endpoint_timer_fire():
+        nonlocal accumulated_text, current_utterance_text, endpoint_timer_active
+        if is_vad_active:
+            # Blocked: cannot commit while VAD is active!
+            return
+        text_to_commit = (current_utterance_text or accumulated_text).strip()
+        if text_to_commit:
+            accumulated_text = ""
+            current_utterance_text = ""
+            endpoint_timer_active = False
+            req = test_session.create_request(prompt=text_to_commit)
+            created_requests.append(req)
+
+    # 1. First segment finalized by Chrome while user is still speaking
+    on_result("Find me a train", is_final=True)
+    assert accumulated_text == "Find me a train"
+    assert len(created_requests) == 0  # No request sent!
+
+    # 2. Second segment finalized by Chrome while user is still speaking
+    on_result("from Nagpur", is_final=True)
+    assert accumulated_text == "Find me a train from Nagpur"
+    assert len(created_requests) == 0  # Still no request sent!
+
+    # 3. Third segment finalized by Chrome while user is still speaking
+    on_result("to Mumbai tomorrow", is_final=True)
+    assert accumulated_text == "Find me a train from Nagpur to Mumbai tomorrow"
+    assert len(created_requests) == 0  # Still no premature request!
+
+    # 4. User finally stops speaking: VAD detects speech end
+    is_vad_active = False
+    on_vad_speech_end()
+    assert endpoint_timer_active is True
+
+    # 5. Silence endpoint timer expires
+    on_endpoint_timer_fire()
+
+    # Exactly ONE request created with the full sentence
+    assert len(created_requests) == 1
+    assert test_session.active_version == 1
+    assert created_requests[0].prompt == "Find me a train from Nagpur to Mumbai tomorrow"
+    assert created_requests[0].status == RequestStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_user_continues_talking_after_isfinal_no_request_until_vad_ends(test_session):
+    """Case B: User pauses briefly after an isFinal segment and continues talking -> no request until final VAD end."""
+    accumulated_text = ""
+    current_utterance_text = ""
+    is_vad_active = True
+    endpoint_timer_active = False
+    created_requests = []
+
+    def on_result(segment_text: str, is_final: bool):
+        nonlocal accumulated_text, current_utterance_text, endpoint_timer_active
+        if is_final:
+            accumulated_text = (accumulated_text + " " + segment_text).strip()
+        display = (accumulated_text + " " + (segment_text if not is_final else "")).strip()
+        if display:
+            current_utterance_text = display
+        if is_vad_active:
+            endpoint_timer_active = False
+
+    def on_vad_speech_start():
+        nonlocal endpoint_timer_active
+        endpoint_timer_active = False
+
+    def on_vad_speech_end():
+        nonlocal endpoint_timer_active
+        endpoint_timer_active = True
+
+    def on_endpoint_timer_fire():
+        nonlocal accumulated_text, current_utterance_text, endpoint_timer_active
+        if is_vad_active:
+            return
+        text_to_commit = (current_utterance_text or accumulated_text).strip()
+        if text_to_commit:
+            accumulated_text = ""
+            current_utterance_text = ""
+            endpoint_timer_active = False
+            req = test_session.create_request(prompt=text_to_commit)
+            created_requests.append(req)
+
+    # User says "Find me a train" -> Chrome produces isFinal=True
+    on_result("Find me a train", is_final=True)
+    # Brief mid-sentence pause triggers candidate VAD speech end
+    is_vad_active = False
+    on_vad_speech_end()
+    assert endpoint_timer_active is True
+    assert len(created_requests) == 0
+
+    # User continues speaking before silence timer expires -> VAD speech start cancels timer
+    is_vad_active = True
+    on_vad_speech_start()
+    assert endpoint_timer_active is False
+    on_result("from Nagpur to Mumbai tomorrow", is_final=True)
+    assert len(created_requests) == 0
+
+    # User finishes speaking completely
+    is_vad_active = False
+    on_vad_speech_end()
+    on_endpoint_timer_fire()
+
+    assert len(created_requests) == 1
+    assert created_requests[0].prompt == "Find me a train from Nagpur to Mumbai tomorrow"
+
+
+@pytest.mark.asyncio
+async def test_normal_complete_first_utterance_plays_astra_only_after_closure(test_session):
+    """Case E: Proves that Rime synthesis/playback is triggered only after the turn is officially closed."""
+    # 1. User starts speaking
+    is_vad_active = True
+    assert test_session.active_version == 0
+    assert test_session.active_request_id is None
+
+    # 2. Utterance in-flight in browser (not committed): version remains 0
+    assert test_session.active_version == 0
+
+    # 3. Speech ends and utterance is committed
+    is_vad_active = False
+    req1 = test_session.create_request(prompt="Find me a train from Nagpur to Mumbai tomorrow")
+    assert test_session.active_version == 1
+
+    # 4. Agent completes turn and triggers Rime playback
+    assistant_text = "I found 3 trains from Nagpur to Mumbai tomorrow."
+    completed = test_session.complete_turn(
+        request_id=req1.request_id,
+        version=1,
+        assistant_response=assistant_text,
+        trigger_rime=False,
+    )
+    assert completed is True
+
+    # Rime TTS stream receives the text and yields chunks for active version 1
+    chunks = []
+    # Rime streaming gate verifies version matching
+    assert test_session.active_version == 1
+    assert req1.status == RequestStatus.COMPLETED

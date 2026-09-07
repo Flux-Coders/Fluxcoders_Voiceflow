@@ -146,6 +146,10 @@ export class AudioEngine {
     }, 25);
   }
 
+  public getIsVadSpeaking(): boolean {
+    return this.isVadSpeaking;
+  }
+
   /**
    * Fast-path hardware muting: immediately sets GainNode to 0.
    */
@@ -190,7 +194,19 @@ export class AudioEngine {
         bytes[i] = binaryString.charCodeAt(i);
       }
 
-      const audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer);
+      let audioBuffer: AudioBuffer;
+      try {
+        audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer.slice(0));
+      } catch {
+        // Raw 16-bit signed PCM fallback (16000 Hz, mono)
+        const sampleCount = Math.floor(bytes.byteLength / 2);
+        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, sampleCount);
+        audioBuffer = this.audioCtx.createBuffer(1, sampleCount, 16000);
+        const channelData = audioBuffer.getChannelData(0);
+        for (let i = 0; i < sampleCount; i++) {
+          channelData[i] = int16[i] / 32768.0;
+        }
+      }
 
       // Check version again after asynchronous decode
       if (chunkVersion !== activeVersion) {
