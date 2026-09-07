@@ -75,14 +75,24 @@ class CDPClient:
                 return resp.get("result", {})
 
     async def evaluate(self, expression: str) -> Any:
-        res = await self.send_cmd(
-            "Runtime.evaluate",
-            {"expression": expression, "returnByValue": True, "awaitPromise": True},
-        )
-        if "exceptionDetails" in res:
-            raise RuntimeError(f"Browser JS Evaluation Error: {res['exceptionDetails']}")
-        result_obj = res.get("result", {})
-        return result_obj.get("value")
+        last_err = None
+        for _ in range(10):
+            try:
+                res = await self.send_cmd(
+                    "Runtime.evaluate",
+                    {"expression": expression, "returnByValue": True, "awaitPromise": True},
+                )
+                if "exceptionDetails" in res:
+                    raise RuntimeError(f"Browser JS Evaluation Error: {res['exceptionDetails']}")
+                result_obj = res.get("result", {})
+                return result_obj.get("value")
+            except Exception as e:
+                last_err = e
+                if "navigated or closed" in str(e):
+                    await asyncio.sleep(0.3)
+                    continue
+                raise e
+        raise last_err
 
     async def capture_screenshot(self, output_path: Path) -> None:
         try:
@@ -267,6 +277,33 @@ async def run_browser_e2e_validation() -> None:
         print(f"  --> Saved Turn 1 In-Flight Screenshot: {shot_tool_running.name}", flush=True)
 
         # ---------------------------------------------------------------------
+        # STEP 1.5: Ambient VAD Noise during tool_running (No False Interruption)
+        # ---------------------------------------------------------------------
+        print(f"\n[4.5/6] Testing Ambient VAD Noise during Tool Running (Must NOT trigger interruption)...", flush=True)
+        vad_noise_res = await cdp.evaluate("""
+            (() => {
+                const engine = window.simulationEngine;
+                const audio = window.audioEngine;
+
+                // Simulate ambient mic spike triggering VAD callbacks
+                audio.onSpeechStartCallbacks.forEach(cb => cb());
+                audio.onSpeechEndCallbacks.forEach(cb => cb());
+
+                return {
+                    agentStatus: engine.state.agentStatus,
+                    activeVersion: engine.state.activeVersion,
+                    rimeStatus: engine.state.rimeState.status,
+                    isMuted: audio.getIsMuted()
+                };
+            })()
+        """)
+        print(f"  --> State after ambient VAD spike: {vad_noise_res}", flush=True)
+        assert vad_noise_res["rimeStatus"] != "aborted_on_interrupt", "ERROR: Ambient VAD spike caused aborted_on_interrupt!"
+        assert not vad_noise_res["isMuted"], "ERROR: Audio was unexpectedly muted!"
+        assert vad_noise_res["activeVersion"] == 41, "ERROR: Active version changed on ambient noise!"
+        print("  [PASS] Ambient VAD noise during processing safely ignored (0 false aborts)", flush=True)
+
+        # ---------------------------------------------------------------------
         # STEP 2: Mid-Flight Voice Interruption (Barge-In)
         # ---------------------------------------------------------------------
         turn2_prompt = "Actually, only after 8 PM in 3A."
@@ -427,6 +464,9 @@ async def run_browser_e2e_validation() -> None:
 
         c2 = bool(support_info["hasSpeechRec"])
         checks.append(("Browser Speech Recognition interface detected and active", c2))
+
+        c_ambient = (vad_noise_res["rimeStatus"] != "aborted_on_interrupt" and not vad_noise_res["isMuted"])
+        checks.append(("Ambient VAD mic noise during processing safely ignored (0 false aborts)", c_ambient))
 
         c3 = (interrupt_res["audioCutMs"] >= 0.0)
         checks.append((f"Fast-path local audio cut executed promptly (measured: {interrupt_res['audioCutMs']:.3f} ms)", c3))

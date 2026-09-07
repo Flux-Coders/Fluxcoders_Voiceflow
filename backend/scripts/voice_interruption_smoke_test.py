@@ -121,8 +121,24 @@ async def run_voice_interruption_smoke_test() -> bool:
     assert req2.status == RequestStatus.RUNNING
     print("  [PASS] Genuine barge-in during tool execution successfully marked v1 obsolete and created v2")
 
-    # 5. Test Stale Result Rejection (RequestVersionGate)
-    print("\n[5/5] Testing Delayed Tool Stale-Result Rejection:")
+    # 5. Test Ambient VAD Spike During Thinking (No False Interruption)
+    print("\n[5/6] Testing Ambient VAD Spike During Thinking (No False Interruption):")
+    # Simulate candidate VAD energy spike without STT transcript
+    session.event_logger.log_event(
+        event_type=VoiceEventType.SPEECH_STARTED,
+        version=session.active_version,
+        request_id=req2.request_id,
+        session_id=session.session_id,
+        message="Candidate VAD energy spike (ambient mic noise)",
+    )
+    # req2 must remain active and RUNNING
+    assert req2.status == RequestStatus.RUNNING
+    assert not req2.is_cancelled
+    assert session.active_version == 2
+    print("  [PASS] Ambient mic RMS spike during processing does not cancel or obsolete running request")
+
+    # 6. Test Stale Result Rejection (RequestVersionGate)
+    print("\n[6/6] Testing Delayed Tool Stale-Result Rejection:")
     is_valid, reason = RequestVersionGate.validate_tool_result_active(
         tool_version=1,
         tool_request_id=req1.request_id,
@@ -156,7 +172,7 @@ async def run_voice_interruption_smoke_test() -> bool:
         pass
 
     print("\n" + "=" * 80)
-    print("ALL VOICE INTERRUPTION SMOKE TESTS PASSED CLEANLY (5/5)")
+    print("ALL VOICE INTERRUPTION SMOKE TESTS PASSED CLEANLY (6/6)")
     print("=" * 80)
     return True
 

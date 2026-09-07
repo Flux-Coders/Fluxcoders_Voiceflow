@@ -748,22 +748,18 @@ class SimulationEngine {
       this.state.isVadActive = true;
 
       const isSpeaking = this.state.agentStatus === 'speaking' || this.state.rimeState.status === 'playing';
-      const isProcessingPreviousUtterance =
-        (this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running') &&
-        !this.isUtteranceInProgress;
 
-      if (isSpeaking || isProcessingPreviousUtterance) {
-        // Genuine barge-in while previous turn was active/speaking
+      if (isSpeaking) {
+        // Genuine barge-in while Rime is speaking: immediate hardware fast-path muting (<1ms)
         audioEngine.fastMuteOutput();
-        this.interrupt('Live VAD user barge-in detected');
-        wsClient.sendInterrupt('Live VAD user barge-in detected', this.state.activeVersion);
+        this.interrupt('Live VAD user barge-in detected while speaking');
+        wsClient.sendInterrupt('Live VAD user barge-in detected while speaking', this.state.activeVersion);
         this.isUtteranceInProgress = true;
       } else {
-        // Normal speech onset / continuation of current utterance
+        // Normal speech onset or ambient energy during thinking/tool_running/idle
         if (this.state.agentStatus === 'idle') {
           this.state.agentStatus = 'listening';
         }
-        this.isUtteranceInProgress = true;
         wsClient.sendSpeechStarted(this.state.activeVersion);
       }
       this.notify();
@@ -782,11 +778,32 @@ class SimulationEngine {
     // Speech Recognition Callbacks
     if (speechRecognition.isSupported()) {
       speechRecognition.onInterim((text) => {
-        this.isUtteranceInProgress = true;
+        const trimmed = text.trim();
+        const isProcessing =
+          this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running';
+
+        if (isProcessing && !this.isUtteranceInProgress && trimmed.length > 0) {
+          // Meaningful STT transcript detected during thinking/tool_running: Genuine barge-in!
+          audioEngine.fastMuteOutput();
+          this.interrupt(`User speech barge-in during processing: "${trimmed}"`);
+          wsClient.sendInterrupt(`User speech barge-in: ${trimmed}`, this.state.activeVersion);
+          this.isUtteranceInProgress = true;
+        } else {
+          this.isUtteranceInProgress = true;
+        }
         wsClient.sendInterimTranscript(text, this.state.activeVersion);
       });
 
       speechRecognition.onFinal((text) => {
+        const trimmed = text.trim();
+        const isProcessing =
+          this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running';
+
+        if (isProcessing && !this.isUtteranceInProgress && trimmed.length > 0) {
+          audioEngine.fastMuteOutput();
+          this.interrupt(`User speech barge-in during processing: "${trimmed}"`);
+          wsClient.sendInterrupt(`User speech barge-in: ${trimmed}`, this.state.activeVersion);
+        }
         this.isUtteranceInProgress = false;
         wsClient.sendFinalTranscript(text, this.state.activeVersion);
       });

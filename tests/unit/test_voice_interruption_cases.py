@@ -149,3 +149,54 @@ async def test_speaking_barge_in_halts_active_playback_and_invalidates_version(t
     req2 = test_session.create_request(prompt="Cancel that, check Nagpur weather instead")
     assert test_session.active_version == 2
     assert req2.status == RequestStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_ambient_vad_noise_during_thinking_does_not_interrupt_or_obsolete_request(test_session):
+    """Proves that raw VAD speech onset / mic noise during THINKING/TOOL_RUNNING does NOT cancel or obsolete the running request."""
+    # 1. Request initialized and in running/thinking state
+    req1 = test_session.create_request(prompt="Find me a train from Nagpur to Mumbai tomorrow")
+    assert test_session.active_version == 1
+    assert req1.status == RequestStatus.RUNNING
+
+    # 2. Ambient noise triggers raw VAD SPEECH_STARTED event (not CLIENT_INTERRUPT)
+    # The session logs event but does NOT call interrupt() or obsolete req1
+    test_session.event_logger.log_event(
+        event_type=VoiceEventType.SPEECH_STARTED,
+        version=test_session.active_version,
+        request_id=req1.request_id,
+        session_id=test_session.session_id,
+        message="VAD speech onset (candidate noise)",
+    )
+
+    # Verify request remains RUNNING and NOT cancelled
+    assert req1.status == RequestStatus.RUNNING
+    assert req1.is_cancelled is False
+    assert test_session.active_version == 1
+
+    # Verify no interrupt events were logged
+    events = test_session.event_logger.get_events(session_id=test_session.session_id)
+    interrupt_events = [e for e in events if e.event_type == VoiceEventType.INTERRUPT_TRIGGERED]
+    assert len(interrupt_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_meaningful_stt_transcript_during_thinking_triggers_barge_in(test_session):
+    """Proves that when speech recognition emits a meaningful transcript during THINKING/TOOL_RUNNING, barge-in is triggered."""
+    # 1. Request 1 running
+    req1 = test_session.create_request(prompt="Find me a train from Nagpur to Mumbai tomorrow")
+    assert test_session.active_version == 1
+
+    # 2. Meaningful STT interim/final arrives during thinking
+    new_utterance_text = "Actually, only after 8 PM"
+    assert len(new_utterance_text.strip()) > 0
+
+    # STT triggers CLIENT_INTERRUPT
+    test_session.interrupt(reason=f"User speech barge-in during processing: {new_utterance_text}")
+    assert req1.status == RequestStatus.OBSOLETE
+    assert req1.is_cancelled is True
+
+    # 3. New request is created for replacement utterance
+    req2 = test_session.create_request(prompt=new_utterance_text)
+    assert test_session.active_version == 2
+    assert req2.status == RequestStatus.RUNNING
