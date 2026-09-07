@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Automatically load environment variables from project root or backend directory
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_ROOT_ENV = _PROJECT_ROOT / ".env"
+_BACKEND_ENV = _PROJECT_ROOT / "backend" / ".env"
+
+if _ROOT_ENV.exists():
+    load_dotenv(dotenv_path=_ROOT_ENV)
+elif _BACKEND_ENV.exists():
+    load_dotenv(dotenv_path=_BACKEND_ENV)
+else:
+    load_dotenv()
 
 from app.models import ConversationState, EventLevel, Request, ToolTask, VoiceEvent
 from app.core.metrics import VoiceMetricsSnapshot

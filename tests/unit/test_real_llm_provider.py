@@ -168,7 +168,7 @@ async def test_successful_chat_completion_no_tools():
         return make_openai_response(content=expected_text, finish_reason="stop")
 
     transport = httpx.MockTransport(handler)
-    config = OpenAIConfig(api_key="sk-test-key")
+    config = OpenAIConfig(api_key="sk-test-key", model="gpt-4o-mini")
     client = OpenAILLMClient(config=config, transport=transport)
 
     messages = [
