@@ -54,7 +54,7 @@ The current verification suite contains 108 passing tests.
 
 ---
 
-Audio Pipeline
+## Audio Pipeline
 
 Rime produces raw PCM audio.
 
@@ -68,7 +68,7 @@ Schedules chunks sequentially to prevent overlap.
 Clears queued playback when a genuine interruption invalidates the current turn.
 
 ---
-Stale Result Protection
+## Stale Result Protection
 
 Each request is associated with:
 
@@ -81,7 +81,8 @@ Therefore, a delayed result from v1 cannot be spoken after v2 has become active.
 
 ---
 
-Limitations
+## Limitations
+
 Browser Speech Recognition support depends on the browser.
 Voice input currently uses browser speech recognition rather than a cloud STT service.
 Environmental acoustic conditions can affect voice activity detection.
