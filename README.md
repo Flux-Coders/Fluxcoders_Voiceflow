@@ -6,7 +6,7 @@ VoiceFlow is an interruption-safe realtime voice agent designed for multi-step r
 
 ## Key Features
 
-1. **Interruption-Safe Orchestration**: Sub-50ms audio cut and task cancellation when user speaks during speech playback or tool execution.
+1. **Interruption-Safe Orchestration**: Fast local audio interruption with server-authoritative request cancellation and stale-result protection.
 2. **Deterministic Request Versioning**: Monotonic `conversation_version` paired with UUID `request_id` prevents obsolete requests from producing active speech or modifying state.
 3. **Three-Level Stale Audio Protection**:
    - **Level 1 (Stream Gate)**: Aborts in-flight HTTP connections immediately upon cancellation.
@@ -50,7 +50,44 @@ cd backend
 pytest tests/ -v
 ```
 
-All 59 unit and failure tests will execute in < 4 seconds.
+The current verification suite contains 108 passing tests.
+
+---
+
+Audio Pipeline
+
+Rime produces raw PCM audio.
+
+VoiceFlow:
+
+Receives streamed PCM chunks from the backend.
+Associates chunks with the active conversation version.
+Rejects obsolete audio.
+Converts 16-bit PCM samples for browser playback.
+Schedules chunks sequentially to prevent overlap.
+Clears queued playback when a genuine interruption invalidates the current turn.
+
+---
+Stale Result Protection
+
+Each request is associated with:
+
+a monotonically increasing conversation version
+a unique request ID
+
+A result is accepted only when it belongs to the currently active request/version.
+
+Therefore, a delayed result from v1 cannot be spoken after v2 has become active.
+
+---
+
+Limitations
+Browser Speech Recognition support depends on the browser.
+Voice input currently uses browser speech recognition rather than a cloud STT service.
+Environmental acoustic conditions can affect voice activity detection.
+Latency varies with the network, model, browser, and runtime environment.
+
+No fixed end-to-end latency claim is made here.
 
 ---
 
