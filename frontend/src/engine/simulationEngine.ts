@@ -14,6 +14,32 @@ import { wsClient, WebSocketMessage } from './websocketClient';
 
 export type StateListener = (state: EngineState) => void;
 
+/**
+ * Qualifies whether an interim or final STT transcript represents genuine user speech
+ * or a transient mic noise / single-character artifact (e.g. "a", "um", "uh", clicks).
+ */
+export function isMeaningfulBargeInTranscript(text: string): boolean {
+  if (!text) return false;
+  const trimmed = text.trim().toLowerCase();
+  if (!trimmed) return false;
+
+  // Single-character tokens (e.g. "a", "i", punctuation, noise)
+  if (trimmed.length <= 1) return false;
+
+  // Common filler sounds and single noise artifacts that are not genuine user intent
+  const noiseArtifacts = new Set(['um', 'uh', 'ah', 'er', 'eh', 'mm', 'hmm', 'oh']);
+  if (noiseArtifacts.has(trimmed)) {
+    return false;
+  }
+
+  // Reject pure punctuation or non-alphanumeric
+  if (!/[a-z0-9]/i.test(trimmed)) {
+    return false;
+  }
+
+  return true;
+}
+
 export interface EngineState {
   agentStatus: AgentStatus;
   isMicActive: boolean;
@@ -46,6 +72,24 @@ class SimulationEngine {
   private listeners: Set<StateListener> = new Set();
   private runningTimeouts: number[] = [];
   private isUtteranceInProgress: boolean = false;
+
+  private speakingBargeInTimerId: number | null = null;
+  private speakingBargeInWindowMs: number = 450;
+  private pendingBargeInVersion: number | null = null;
+  private pendingBargeInRequestId: string | null = null;
+
+  public setSpeakingBargeInWindowMs(ms: number): void {
+    this.speakingBargeInWindowMs = ms;
+  }
+
+  private clearSpeakingBargeInWindow(): void {
+    if (this.speakingBargeInTimerId) {
+      window.clearTimeout(this.speakingBargeInTimerId);
+      this.speakingBargeInTimerId = null;
+    }
+    this.pendingBargeInVersion = null;
+    this.pendingBargeInRequestId = null;
+  }
 
   constructor() {
     this.state = {
@@ -165,7 +209,9 @@ class SimulationEngine {
 
   public resetSession() {
     this.clearTimeouts();
+    this.clearSpeakingBargeInWindow();
     speechRecognition.clearPendingUtterance();
+    audioEngine.resetPlaybackQueue();
     this.isUtteranceInProgress = false;
     this.state.agentStatus = 'idle';
     this.state.activeVersion = 40;
@@ -205,7 +251,10 @@ class SimulationEngine {
    * Can be invoked manually by clicking 'Interrupt' or programmatically by scenarios.
    */
   public interrupt(reason: string = 'User spoken interruption') {
+    this.clearSpeakingBargeInWindow();
     speechRecognition.clearPendingUtterance();
+    audioEngine.fastMuteOutput();
+    audioEngine.resetPlaybackQueue();
     this.isUtteranceInProgress = false;
     const tInterruptStart = performance.now();
     const prevVersion = this.state.activeVersion;
@@ -753,11 +802,39 @@ class SimulationEngine {
       const isSpeaking = this.state.agentStatus === 'speaking' || this.state.rimeState.status === 'playing';
 
       if (isSpeaking) {
-        // Genuine barge-in while Rime is speaking: immediate hardware fast-path muting (<1ms)
+        // Potential barge-in while Rime is speaking: immediately fast-mute output
         audioEngine.fastMuteOutput();
-        this.interrupt('Live VAD user barge-in detected while speaking');
-        wsClient.sendInterrupt('Live VAD user barge-in detected while speaking', this.state.activeVersion);
-        this.isUtteranceInProgress = true;
+
+        // Record active request & version for qualification
+        const targetVersion = this.state.activeVersion;
+        const targetReqId = this.state.activeRequestId || this.state.rimeState.activeRequestId;
+        this.pendingBargeInVersion = targetVersion;
+        this.pendingBargeInRequestId = targetReqId;
+
+        // Clear any prior confirmation timer
+        if (this.speakingBargeInTimerId) {
+          window.clearTimeout(this.speakingBargeInTimerId);
+        }
+
+        // Arm barge-in confirmation window (e.g. 450ms). If no meaningful STT text arrives, restore audio output.
+        this.speakingBargeInTimerId = window.setTimeout(() => {
+          const wasVersion = this.pendingBargeInVersion;
+          const wasReqId = this.pendingBargeInRequestId;
+          this.clearSpeakingBargeInWindow();
+
+          const currentVersion = this.state.activeVersion;
+          const currentReqId = this.state.activeRequestId || this.state.rimeState.activeRequestId;
+
+          // Version safety: Resume playback ONLY if the SAME request and version are still active!
+          if (
+            wasVersion !== null &&
+            wasVersion === currentVersion &&
+            (!wasReqId || wasReqId === currentReqId) &&
+            (this.state.agentStatus === 'speaking' || this.state.rimeState.status === 'playing')
+          ) {
+            audioEngine.unmuteOutput();
+          }
+        }, this.speakingBargeInWindowMs);
       } else {
         // Normal speech onset or ambient energy during thinking/tool_running/idle
         if (this.state.agentStatus === 'idle') {
@@ -782,34 +859,55 @@ class SimulationEngine {
     // Speech Recognition Callbacks
     if (speechRecognition.isSupported()) {
       speechRecognition.onInterim((text) => {
-        const trimmed = text.trim();
+        const isSpeaking =
+          this.state.agentStatus === 'speaking' ||
+          this.state.rimeState.status === 'playing' ||
+          this.speakingBargeInTimerId !== null;
         const isProcessing =
           this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running';
 
-        if (isProcessing && !this.isUtteranceInProgress && trimmed.length > 0) {
-          // Meaningful STT transcript detected during thinking/tool_running: Genuine barge-in!
+        const isMeaningful = isMeaningfulBargeInTranscript(text);
+
+        if ((isSpeaking || isProcessing) && !this.isUtteranceInProgress && isMeaningful) {
+          // Meaningful STT transcript detected: Genuine barge-in confirmed!
+          this.clearSpeakingBargeInWindow();
           audioEngine.fastMuteOutput();
-          this.interrupt(`User speech barge-in during processing: "${trimmed}"`);
-          wsClient.sendInterrupt(`User speech barge-in: ${trimmed}`, this.state.activeVersion);
+          audioEngine.resetPlaybackQueue();
+          const trimmed = text.trim();
+          const reason = isSpeaking ? `User voice barge-in while speaking: "${trimmed}"` : `User speech barge-in during processing: "${trimmed}"`;
+          this.interrupt(reason);
+          wsClient.sendInterrupt(reason, this.state.activeVersion);
           this.isUtteranceInProgress = true;
-        } else {
+        } else if (isMeaningful) {
           this.isUtteranceInProgress = true;
         }
         wsClient.sendInterimTranscript(text, this.state.activeVersion);
       });
 
       speechRecognition.onFinal((text) => {
-        const trimmed = text.trim();
+        const isSpeaking =
+          this.state.agentStatus === 'speaking' ||
+          this.state.rimeState.status === 'playing' ||
+          this.speakingBargeInTimerId !== null;
         const isProcessing =
           this.state.agentStatus === 'thinking' || this.state.agentStatus === 'tool_running';
 
-        if (isProcessing && !this.isUtteranceInProgress && trimmed.length > 0) {
+        const isMeaningful = isMeaningfulBargeInTranscript(text);
+
+        if ((isSpeaking || isProcessing) && !this.isUtteranceInProgress && isMeaningful) {
+          this.clearSpeakingBargeInWindow();
           audioEngine.fastMuteOutput();
-          this.interrupt(`User speech barge-in during processing: "${trimmed}"`);
-          wsClient.sendInterrupt(`User speech barge-in: ${trimmed}`, this.state.activeVersion);
+          audioEngine.resetPlaybackQueue();
+          const trimmed = text.trim();
+          const reason = isSpeaking ? `User voice barge-in while speaking: "${trimmed}"` : `User speech barge-in during processing: "${trimmed}"`;
+          this.interrupt(reason);
+          wsClient.sendInterrupt(reason, this.state.activeVersion);
         }
+        this.clearSpeakingBargeInWindow();
         this.isUtteranceInProgress = false;
-        wsClient.sendFinalTranscript(text, this.state.activeVersion);
+        if (isMeaningful) {
+          wsClient.sendFinalTranscript(text, this.state.activeVersion);
+        }
       });
 
       speechRecognition.start();
@@ -828,6 +926,11 @@ class SimulationEngine {
           this.state.agentStatus = msg.agent_status;
           if (msg.agent_status === 'idle' && this.state.rimeState.status === 'playing') {
             this.state.rimeState.status = 'idle';
+          }
+          if (msg.agent_status === 'thinking' || msg.agent_status === 'listening' || msg.agent_status === 'tool_running') {
+            if (this.state.rimeState.status === 'aborted_on_interrupt' || this.state.rimeState.status === 'drained') {
+              this.state.rimeState.status = 'idle';
+            }
           }
         }
         if (msg.extra?.assistant_response && !this.state.isStressTesting) {
@@ -872,7 +975,9 @@ class SimulationEngine {
    * Disables live voice mode and disconnects hardware.
    */
   public disableLiveVoiceMode(): void {
+    this.clearSpeakingBargeInWindow();
     audioEngine.stopMicrophone();
+    audioEngine.resetPlaybackQueue();
     speechRecognition.stop();
     speechRecognition.clearPendingUtterance();
     this.isUtteranceInProgress = false;

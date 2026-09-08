@@ -19,16 +19,18 @@ export class AudioEngine {
   
   private vadIntervalId: number | null = null;
   private isVadSpeaking: boolean = false;
-  private vadSpeechStartTime: number = 0;
+  private lastSpeechDetectedTime: number = 0;
   
   private onSpeechStartCallbacks: Array<() => void> = [];
   private onSpeechEndCallbacks: Array<() => void> = [];
   private onMicLevelCallbacks: Array<(level: number) => void> = [];
 
   private isMuted: boolean = false;
+  private nextPlayTime: number = 0;
+  private activeAudioSources: AudioBufferSourceNode[] = [];
 
   private vadConfig: VADConfig = {
-    energyThreshold: 0.015,
+    energyThreshold: 0.02,
     holdTimeMs: 400,
   };
 
@@ -102,6 +104,31 @@ export class AudioEngine {
     }
 
     this.isVadSpeaking = false;
+    this.lastSpeechDetectedTime = 0;
+  }
+
+  /**
+   * Resets the scheduled playback timeline and stops any queued audio sources.
+   */
+  public resetPlaybackQueue(): void {
+    for (const source of this.activeAudioSources) {
+      try {
+        source.stop();
+        source.disconnect();
+      } catch {
+        // Source may have already completed naturally
+      }
+    }
+    this.activeAudioSources = [];
+    this.nextPlayTime = 0;
+  }
+
+  public getNextPlayTime(): number {
+    return this.nextPlayTime;
+  }
+
+  public getActiveSourcesCount(): number {
+    return this.activeAudioSources.length;
   }
 
   /**
@@ -131,14 +158,14 @@ export class AudioEngine {
 
       const now = performance.now();
       if (rms > this.vadConfig.energyThreshold) {
+        this.lastSpeechDetectedTime = now;
         if (!this.isVadSpeaking) {
           this.isVadSpeaking = true;
-          this.vadSpeechStartTime = now;
           // Notify speech onset listeners ONLY (do not unconditionally mute here)
           this.onSpeechStartCallbacks.forEach((cb) => cb());
         }
       } else {
-        if (this.isVadSpeaking && now - this.vadSpeechStartTime > this.vadConfig.holdTimeMs) {
+        if (this.isVadSpeaking && (now - this.lastSpeechDetectedTime >= this.vadConfig.holdTimeMs)) {
           this.isVadSpeaking = false;
           this.onSpeechEndCallbacks.forEach((cb) => cb());
         }
@@ -176,6 +203,7 @@ export class AudioEngine {
 
   /**
    * Plays a decoded Rime audio chunk if its version matches the active version.
+   * Decodes 16-bit raw PCM directly and schedules sequential playback.
    */
   public async playAudioChunk(audioBase64: string, chunkVersion: number, activeVersion: number): Promise<void> {
     if (chunkVersion !== activeVersion) {
@@ -194,18 +222,15 @@ export class AudioEngine {
         bytes[i] = binaryString.charCodeAt(i);
       }
 
-      let audioBuffer: AudioBuffer;
-      try {
-        audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer.slice(0));
-      } catch {
-        // Raw 16-bit signed PCM fallback (16000 Hz, mono)
-        const sampleCount = Math.floor(bytes.byteLength / 2);
-        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, sampleCount);
-        audioBuffer = this.audioCtx.createBuffer(1, sampleCount, 16000);
-        const channelData = audioBuffer.getChannelData(0);
-        for (let i = 0; i < sampleCount; i++) {
-          channelData[i] = int16[i] / 32768.0;
-        }
+      const sampleCount = Math.floor(bytes.byteLength / 2);
+      if (sampleCount === 0) return;
+
+      // Direct 16-bit signed LE PCM decoding (16000 Hz, mono)
+      const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, sampleCount);
+      const audioBuffer = this.audioCtx.createBuffer(1, sampleCount, 16000);
+      const channelData = audioBuffer.getChannelData(0);
+      for (let i = 0; i < sampleCount; i++) {
+        channelData[i] = int16[i] / 32768.0;
       }
 
       // Check version again after asynchronous decode
@@ -215,10 +240,24 @@ export class AudioEngine {
 
       // Unmute for active version playback
       this.unmuteOutput();
+
+      const currentTime = this.audioCtx.currentTime;
+      const startTime = Math.max(currentTime, this.nextPlayTime);
+
       const source = this.audioCtx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(this.outputGain);
-      source.start();
+      source.start(startTime);
+
+      this.nextPlayTime = startTime + audioBuffer.duration;
+
+      this.activeAudioSources.push(source);
+      source.onended = () => {
+        const idx = this.activeAudioSources.indexOf(source);
+        if (idx !== -1) {
+          this.activeAudioSources.splice(idx, 1);
+        }
+      };
     } catch (err) {
       console.warn('Error decoding/playing Rime audio chunk:', err);
     }

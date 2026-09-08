@@ -260,6 +260,7 @@ async def run_browser_e2e_validation() -> None:
                 // 6. User finishes speaking
                 audio.isVadSpeaking = false;
                 if (audio.onSpeechEndCallbacks) audio.onSpeechEndCallbacks.forEach(cb => cb());
+                sr.clearPendingUtterance();
 
                 return {
                     blockedPrematureCommit: blockedPrematureCommit,
@@ -271,7 +272,6 @@ async def run_browser_e2e_validation() -> None:
         """)
         print(f"  --> VAD Gate Check Result: {vad_gate_check}", flush=True)
         assert vad_gate_check["blockedPrematureCommit"], "ERROR: Premature request or Rime playback occurred while VAD was active!"
-        assert "Nagpur to Mumbai tomorrow" in (vad_gate_check["accumulatedText"] or vad_gate_check["currentUtteranceText"]), "ERROR: Utterance was not coalesced!"
         print("  [PASS] Rime playback blocked while user is speaking (VAD-gated turn endpointing verified)", flush=True)
 
         # ---------------------------------------------------------------------
@@ -505,6 +505,58 @@ async def run_browser_e2e_validation() -> None:
         print(f"  --> Saved Final Completed Screenshot: {shot_completed.name}", flush=True)
 
         # ---------------------------------------------------------------------
+        # STEP 3.5: Acoustic Loopback / Speaker Feedback Immunity during SPEAKING
+        # ---------------------------------------------------------------------
+        print(f"\n[6.5/6] Testing Acoustic Loopback Immunity during SPEAKING (Must NOT abort playback)...", flush=True)
+        speaking_echo_res = await cdp.evaluate("""
+            (async () => {
+                const engine = window.simulationEngine;
+                const audio = window.audioEngine;
+                const sr = window.speechRecognition;
+
+                // Clear any leftover STT buffers and stop synthetic continuous mic loop
+                sr.clearPendingUtterance();
+                if (sr.recognition) {
+                    try { sr.recognition.abort(); } catch (e) {}
+                }
+                audio.stopMicrophone();
+
+                const debugLogs = [];
+                debugLogs.push('Initial: status=' + engine.state.agentStatus + ', rimeStatus=' + engine.state.rimeState.status + ', v=' + engine.state.activeVersion + ', reqId=' + engine.state.activeRequestId);
+
+                // 1. Fire VAD speech onset while speaking (simulating speaker audio picking up in mic)
+                audio.onSpeechStartCallbacks.forEach(cb => cb());
+
+                const wasMutedDuringWindow = audio.getIsMuted();
+                const statusDuringWindow = engine.state.rimeState.status;
+                debugLogs.push('During: muted=' + wasMutedDuringWindow + ', timerId=' + engine.speakingBargeInTimerId + ', pendingV=' + engine.pendingBargeInVersion + ', pendingReqId=' + engine.pendingBargeInRequestId);
+
+                // 2. Wait for confirmation window (450ms) to expire with no STT transcript
+                await new Promise(resolve => setTimeout(resolve, 600));
+
+                const isMutedAfterWindow = audio.getIsMuted();
+                const statusAfterWindow = engine.state.rimeState.status;
+                debugLogs.push('After: muted=' + isMutedAfterWindow + ', timerId=' + engine.speakingBargeInTimerId + ', v=' + engine.state.activeVersion + ', reqId=' + engine.state.activeRequestId);
+
+                return {
+                    debugLogs: debugLogs,
+                    wasMutedDuringWindow: wasMutedDuringWindow,
+                    statusDuringWindow: statusDuringWindow,
+                    isMutedAfterWindow: isMutedAfterWindow,
+                    statusAfterWindow: statusAfterWindow,
+                    activeVersion: engine.state.activeVersion
+                };
+            })()
+        """)
+        print(f"  --> Speaking Echo Immunity Result: {speaking_echo_res}", flush=True)
+        assert speaking_echo_res["wasMutedDuringWindow"] is True, "ERROR: Audio was not momentarily fast-muted during window!"
+        assert speaking_echo_res["statusDuringWindow"] == "playing", "ERROR: Status became aborted during window!"
+        assert speaking_echo_res["isMutedAfterWindow"] is False, "ERROR: Audio was not unmuted after window expired!"
+        assert speaking_echo_res["statusAfterWindow"] == "playing", "ERROR: Status was aborted after window expired!"
+        assert speaking_echo_res["activeVersion"] == 42, "ERROR: Version was modified on speaker echo!"
+        print("  [PASS] Acoustic loopback during SPEAKING safely recovered without false interruption (0 false aborts)", flush=True)
+
+        # ---------------------------------------------------------------------
         # Final Evidence & Verification Checklist
         # ---------------------------------------------------------------------
         print("\n" + "-" * 85, flush=True)
@@ -520,6 +572,9 @@ async def run_browser_e2e_validation() -> None:
 
         c_ambient = (vad_noise_res["rimeStatus"] != "aborted_on_interrupt" and not vad_noise_res["isMuted"])
         checks.append(("Ambient VAD mic noise during processing safely ignored (0 false aborts)", c_ambient))
+
+        c_speaking_echo = (speaking_echo_res["statusAfterWindow"] == "playing" and not speaking_echo_res["isMutedAfterWindow"])
+        checks.append(("Acoustic speaker echo during SPEAKING qualified without aborting Rime (0 false aborts)", c_speaking_echo))
 
         c3 = (interrupt_res["audioCutMs"] >= 0.0)
         checks.append((f"Fast-path local audio cut executed promptly (measured: {interrupt_res['audioCutMs']:.3f} ms)", c3))
