@@ -140,7 +140,7 @@ class Session:
         return req
 
     def interrupt(self, reason: str = "User interruption") -> Dict[str, Any]:
-        """Triggers sub-50ms audio cut, marks the active request obsolete/invalidated, and cancels tasks."""
+        """Triggers immediate local audio cut, marks the active request obsolete/invalidated, and cancels tasks."""
         prev_version = self.active_version
         prev_req_id = self.active_request_id or "none"
 

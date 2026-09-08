@@ -111,7 +111,7 @@ backend/
 - **`ToolRegistry`**:
   - Enforces registration, permissions, and typed parameter validation for all callable tools.
 - **`ToolExecutor` & `RequestVersionGate`**:
-  - Executes tool functions asynchronously with 50ms cooperative cancellation checks; discards late results if version changed.
+  - Executes tool functions asynchronously with periodic cooperative cancellation checks; discards late results if version changed.
 - **`RimeTTSGate` & `MetricsCollector`**:
   - Ensures only valid, active requests reach TTS. Measures latency dynamically via `time.perf_counter()`.
 
@@ -134,7 +134,7 @@ backend/
 ### Scenario B: Interruption During Speech Playback (Test 2)
 - Agent is currently streaming Rime audio for `(v1, req-001)`.
 - User speaks: "Wait".
-- Fast-path: Client mutes local audio playback immediately (<10ms).
+- Fast-path: Client mutes local audio playback.
 - VAD / STT fires `SpeechStartedEvent`.
 - `SessionManager` triggers hard cancellation on `(v1, req-001)`:
   - Aborts active Rime TTS streaming connection.
@@ -188,7 +188,7 @@ class RequestContext:
 
 ## 6. Interruption & Cancellation Strategy
 
-### Tier 1: Fast-Path Audio Suppression (< 50ms)
+### Tier 1: Fast-Path Audio Suppression
 - **Client-Side**: Immediate gain-node cutoff and audio buffer drain on VAD trip.
 - **Transport-Side**: LiveKit DataChannel emits an immediate `OP_INTERRUPT` packet.
 - **Backend Audio Dispatcher**: Drops all pending PCM/Opus chunks in the queue for the active track; sends silence frames if needed to reset WebRTC jitter buffers.
